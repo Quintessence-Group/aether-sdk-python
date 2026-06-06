@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install SDK + dev deps
+        run: pip install -e ".[dev]"
+
+      - name: Import check
+        run: python -c "from aether.client import AetherClient; print('SDK import OK')"
+
+      - name: CLI entry point
+        run: aether-py --help
+
+      - name: Test
+        run: pytest
+
+      - name: Build + check distribution
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
