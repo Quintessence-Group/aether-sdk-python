@@ -409,9 +409,25 @@ class AsyncAetherClient:
     # ── Search ────────────────────────────────────────────────────────
 
     async def search(
-        self, query: str, k: int = 10, include_content: bool = False, tags: list[str] | None = None,
+        self,
+        query: str,
+        k: int = 10,
+        include_content: bool = False,
+        tags: list[str] | None = None,
+        max_distance: float | None = None,
     ) -> list[SearchResult]:
-        """Similarity search across documents."""
+        """Similarity search across documents.
+
+        Args:
+            query: Search query.
+            k: Maximum number of results to return.
+            include_content: Include document text in each result.
+            tags: Optional tag filter; results must carry all listed tags.
+            max_distance: Optional cosine-distance ceiling. Results with
+                ``distance > max_distance`` are dropped server-side, after
+                reranking. Omit (or pass ``None``) to return the top-k regardless
+                of distance — the historical behavior.
+        """
         if not query:
             raise ValueError("query cannot be empty")
         if k < 1:
@@ -421,6 +437,8 @@ class AsyncAetherClient:
             params["include_content"] = "true"
         if tags:
             params["tags"] = ",".join(tags)
+        if max_distance is not None:
+            params["max_distance"] = max_distance
         resp = await self._request_with_retry("GET","/search", params=params)
         self._raise_for_status(resp)
         body = resp.json()
@@ -436,17 +454,31 @@ class AsyncAetherClient:
             for r in body.get("results", [])
         ]
 
-    async def retrieve(self, query: str, k: int = 5, tags: list[str] | None = None) -> list[RetrievalResult]:
+    async def retrieve(
+        self,
+        query: str,
+        k: int = 5,
+        tags: list[str] | None = None,
+        max_distance: float | None = None,
+    ) -> list[RetrievalResult]:
         """Search and return results with document content included.
 
         Uses server-side include_content when available.
         Falls back to parallel downloads via asyncio.gather().
+
+        See :py:meth:`search` for the semantics of ``max_distance``.
         """
         if not query:
             raise ValueError("query cannot be empty")
         if k < 1:
             raise ValueError("k must be at least 1")
-        results = await self.search(query, k=k, include_content=True, tags=tags)
+        results = await self.search(
+            query,
+            k=k,
+            include_content=True,
+            tags=tags,
+            max_distance=max_distance,
+        )
 
         # Deduplicate by doc_id, keeping the closest match
         seen: dict[str, SearchResult] = {}
@@ -517,8 +549,12 @@ class AsyncAetherClient:
         k: int = 10,
         include_content: bool = False,
         tags: list[str] | None = None,
+        max_distance: float | None = None,
     ) -> list[SearchResult]:
-        """Search using a pre-computed query embedding."""
+        """Search using a pre-computed query embedding.
+
+        See :py:meth:`search` for the semantics of ``max_distance``.
+        """
         if not embedding:
             raise ValueError("embedding cannot be empty")
         if k < 1:
@@ -526,6 +562,8 @@ class AsyncAetherClient:
         body: dict = {"embedding": embedding, "k": k, "include_content": include_content}
         if tags:
             body["tags"] = tags
+        if max_distance is not None:
+            body["max_distance"] = max_distance
         resp = await self._request_with_retry("POST","/search/embed", json=body)
         self._raise_for_status(resp)
         r = resp.json()

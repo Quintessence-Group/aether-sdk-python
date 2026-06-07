@@ -354,18 +354,39 @@ class AetherClient:
         self._raise_for_status(resp)
         return resp.content.decode("utf-8")
 
-    def retrieve(self, query: str, k: int = 5, tags: list[str] | None = None) -> list[RetrievalResult]:
+    def retrieve(
+        self,
+        query: str,
+        k: int = 5,
+        tags: list[str] | None = None,
+        max_distance: float | None = None,
+    ) -> list[RetrievalResult]:
         """Search and return results with document content included.
 
         Combines search() + download_text() into a single call for RAG workflows.
         Results are deduplicated by doc_id (closest match wins).
         Uses server-side include_content when available, falling back to per-doc downloads.
+
+        Args:
+            query: Search query.
+            k: Maximum number of results to return.
+            tags: Optional tag filter; results must carry all listed tags.
+            max_distance: Optional cosine-distance ceiling. Results with
+                ``distance > max_distance`` are dropped server-side, after
+                reranking. Omit (or pass ``None``) to return the top-k regardless
+                of distance — the historical behavior.
         """
         if not query:
             raise ValueError("query cannot be empty")
         if k < 1:
             raise ValueError("k must be at least 1")
-        results = self.search(query, k=k, include_content=True, tags=tags)
+        results = self.search(
+            query,
+            k=k,
+            include_content=True,
+            tags=tags,
+            max_distance=max_distance,
+        )
 
         # Deduplicate by doc_id, keeping the closest match
         seen: dict[str, SearchResult] = {}
@@ -441,9 +462,25 @@ class AetherClient:
     # ── Search ────────────────────────────────────────────────────────
 
     def search(
-        self, query: str, k: int = 10, include_content: bool = False, tags: list[str] | None = None,
+        self,
+        query: str,
+        k: int = 10,
+        include_content: bool = False,
+        tags: list[str] | None = None,
+        max_distance: float | None = None,
     ) -> list[SearchResult]:
-        """Similarity search across documents."""
+        """Similarity search across documents.
+
+        Args:
+            query: Search query.
+            k: Maximum number of results to return.
+            include_content: Include document text in each result.
+            tags: Optional tag filter; results must carry all listed tags.
+            max_distance: Optional cosine-distance ceiling. Results with
+                ``distance > max_distance`` are dropped server-side, after
+                reranking. Omit (or pass ``None``) to return the top-k regardless
+                of distance — the historical behavior.
+        """
         if not query:
             raise ValueError("query cannot be empty")
         if k < 1:
@@ -453,6 +490,8 @@ class AetherClient:
             params["include_content"] = "true"
         if tags:
             params["tags"] = ",".join(tags)
+        if max_distance is not None:
+            params["max_distance"] = max_distance
         resp = self._request_with_retry("GET","/search", params=params)
         self._raise_for_status(resp)
         body = resp.json()
@@ -511,8 +550,12 @@ class AetherClient:
         k: int = 10,
         include_content: bool = False,
         tags: list[str] | None = None,
+        max_distance: float | None = None,
     ) -> list[SearchResult]:
-        """Search using a pre-computed query embedding."""
+        """Search using a pre-computed query embedding.
+
+        See :py:meth:`search` for the semantics of ``max_distance``.
+        """
         if not embedding:
             raise ValueError("embedding cannot be empty")
         if k < 1:
@@ -520,6 +563,8 @@ class AetherClient:
         body: dict = {"embedding": embedding, "k": k, "include_content": include_content}
         if tags:
             body["tags"] = tags
+        if max_distance is not None:
+            body["max_distance"] = max_distance
         resp = self._request_with_retry("POST","/search/embed", json=body)
         self._raise_for_status(resp)
         r = resp.json()
