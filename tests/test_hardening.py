@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from aether import AetherClient
+from aether import AetherClient, DocumentPage
 from aether._internal import USER_AGENT
 
 
@@ -54,6 +54,40 @@ class TestIdempotencyKey:
             client.status()
         _, kwargs = req.call_args
         assert "Idempotency-Key" not in (kwargs.get("headers") or {})
+
+
+class TestListPagination:
+    def test_list_returns_documents_and_metadata(self):
+        client = AetherClient(base_url="http://localhost:9000", max_retries=0)
+        resp = _ok_response()
+        resp.json.return_value = {
+            "documents": [
+                {"doc_id": "d1", "title": "A", "size_bytes": 10},
+                {"doc_id": "d2", "title": "B", "size_bytes": 20},
+            ],
+            "count": 2,
+            "total": 57,
+            "has_more": True,
+        }
+        with patch.object(client._client, "request", return_value=resp):
+            page = client.list(offset=0, limit=2)
+
+        # Backward compatible: behaves like a list[DocumentRecord]
+        assert isinstance(page, (list, DocumentPage))
+        assert len(page) == 2
+        assert [d.doc_id for d in page] == ["d1", "d2"]
+        # New: pagination metadata
+        assert page.total == 57
+        assert page.has_more is True
+
+    def test_metadata_defaults_when_absent(self):
+        client = AetherClient(base_url="http://localhost:9000", max_retries=0)
+        resp = _ok_response()
+        resp.json.return_value = {"documents": [{"doc_id": "d1"}]}
+        with patch.object(client._client, "request", return_value=resp):
+            page = client.list()
+        assert page.total == 1       # falls back to len(documents)
+        assert page.has_more is False
 
 
 class TestInsecureUrlEnforcement:
