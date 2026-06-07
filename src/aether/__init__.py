@@ -1,5 +1,6 @@
 """Aether Python SDK."""
 
+from ._internal import __version__
 from .async_client import AsyncAetherClient
 from .client import AetherClient
 from .errors import (
@@ -22,6 +23,7 @@ from .models import (
 )
 
 __all__ = [
+    "__version__",
     "AetherClient",
     "AsyncAetherClient",
     "AetherError",
