@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 import httpx
 
+from ._internal import USER_AGENT, enforce_secure_base_url, new_idempotency_key
 from .errors import AetherApiError, AetherNetworkError, aether_api_error_from_response
 from .models import (
     BatchInsertItem,
@@ -48,7 +49,8 @@ class AetherClient:
             base_url or os.environ.get("AETHER_BASE_URL") or "https://api.aetherdb.ai"
         ).rstrip("/")
         api_key = api_key or os.environ.get("AETHER_API_KEY")
-        headers = {}
+        enforce_secure_base_url(self.base_url, api_key)
+        headers = {"User-Agent": USER_AGENT}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         self._client = httpx.Client(base_url=self.base_url, timeout=timeout, headers=headers)
@@ -85,6 +87,14 @@ class AetherClient:
         last_error: Optional[Exception] = None
         resp: Optional[httpx.Response] = None
         max_attempts = self._max_retries + 1
+
+        # Attach a stable idempotency key to non-idempotent writes so the server
+        # can deduplicate a retry whose original response was lost in transit.
+        headers = dict(kwargs.pop("headers", None) or {})
+        if method.upper() == "POST" and "Idempotency-Key" not in headers:
+            headers["Idempotency-Key"] = new_idempotency_key()
+        if headers:
+            kwargs["headers"] = headers
 
         for attempt in range(max_attempts):
             try:
@@ -253,7 +263,9 @@ class AetherClient:
             url += f"&chunk_size={chunk_size}"
         if overlap is not None:
             url += f"&overlap={overlap}"
-        resp = self._client.post(url, content=stream)
+        resp = self._client.post(
+            url, content=stream, headers={"Idempotency-Key": new_idempotency_key()}
+        )
         self._raise_for_status(resp)
         body = resp.json()
         return DocumentRecord(
