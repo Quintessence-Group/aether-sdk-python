@@ -19,6 +19,7 @@ from .models import (
     BatchInsertItem,
     BatchSearchQuery,
     BatchSearchResponse,
+    DocumentPage,
     DocumentRecord,
     NodeStatus,
     RetrievalResult,
@@ -359,17 +360,21 @@ class AsyncAetherClient:
         self,
         offset: int = 0,
         limit: int = 50,
-    ) -> list[DocumentRecord]:
+    ) -> DocumentPage:
         """List active documents with pagination.
 
         Args:
             offset: Number of documents to skip. Default: 0.
             limit: Maximum number of documents to return. Default: 50, max: 1000.
+
+        Returns:
+            A :class:`DocumentPage` (a ``list`` subclass) of records, with
+            ``.total`` and ``.has_more`` pagination metadata attached.
         """
         resp = await self._request_with_retry("GET","/documents", params={"offset": offset, "limit": limit})
         self._raise_for_status(resp)
         body = resp.json()
-        return [
+        documents = [
             DocumentRecord(
                 doc_id=d["doc_id"],
                 cid="",
@@ -381,6 +386,11 @@ class AsyncAetherClient:
             )
             for d in body.get("documents", [])
         ]
+        return DocumentPage(
+            documents,
+            total=body.get("total", len(documents)),
+            has_more=body.get("has_more", False),
+        )
 
     async def delete(self, doc_id: str) -> None:
         """Tombstone a document."""

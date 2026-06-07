@@ -50,6 +50,25 @@ class RetrievalResult:
     content_type: str = "text/plain"
     passage: Optional[str] = None
 
+class DocumentPage(list):
+    """A page of documents returned by ``list()``.
+
+    Subclasses :class:`list`, so it behaves exactly like a
+    ``list[DocumentRecord]`` (iteration, indexing, ``len()``) for backward
+    compatibility, while also exposing pagination metadata for parity with the
+    TypeScript, Go, and .NET SDKs.
+
+    Attributes:
+        total: Total number of active documents across all pages.
+        has_more: Whether additional pages exist beyond this one.
+    """
+
+    def __init__(self, documents=(), total: int = 0, has_more: bool = False):
+        super().__init__(documents)
+        self.total = total
+        self.has_more = has_more
+
+
 @dataclass
 class BatchInsertItem:
     filename: str
