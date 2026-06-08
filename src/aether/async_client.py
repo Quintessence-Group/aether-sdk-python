@@ -635,7 +635,7 @@ class AsyncAetherClient:
             raise ValueError("documents cannot be empty")
         payload: dict = {
             "documents": [
-                {"filename": d.filename, "content": d.content, **({"tags": d.tags} if d.tags else {})}
+                {"filename": d.filename, "content": d.content, **({"tags": ",".join(d.tags)} if d.tags else {})}
                 for d in documents
             ],
         }
@@ -670,7 +670,7 @@ class AsyncAetherClient:
                 {
                     "q": q.q,
                     "k": q.k,
-                    **({"tags": q.tags} if q.tags else {}),
+                    **({"tags": ",".join(q.tags)} if q.tags else {}),
                     **({"include_content": q.include_content} if q.include_content else {}),
                 }
                 for q in queries
