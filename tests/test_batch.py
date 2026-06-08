@@ -41,6 +41,24 @@ def test_batch_insert(client):
     assert "/documents/batch" in call_args[0][1]  # url
 
 
+def test_batch_insert_tags_are_comma_joined_string(client):
+    """The API batch deserializer expects tags as a comma-joined string, not a JSON array."""
+    mock_resp = _ok_response()
+    mock_resp.json.return_value = {
+        "results": [
+            {"doc_id": "b1", "cid": "c1", "chunks": 2, "vectors": 2, "version": 1},
+        ],
+    }
+
+    with patch.object(client._client, "request", return_value=mock_resp) as mock_req:
+        client.batch_insert(
+            [BatchInsertItem(filename="a.txt", content="hello", tags=["alpha", "beta"])]
+        )
+
+    payload = mock_req.call_args.kwargs["json"]
+    assert payload["documents"][0]["tags"] == "alpha,beta"
+
+
 def test_batch_search(client):
     mock_resp = _ok_response()
     mock_resp.json.return_value = {
@@ -63,3 +81,19 @@ def test_batch_search(client):
     call_args = mock_req.call_args
     assert call_args[0][0] == "POST"
     assert "/search/batch" in call_args[0][1]
+
+
+def test_batch_search_tags_are_comma_joined_string(client):
+    """Batch search queries that carry tags must send them as a comma-joined string."""
+    mock_resp = _ok_response()
+    mock_resp.json.return_value = {
+        "results": [
+            {"query": "test", "results": []},
+        ],
+    }
+
+    with patch.object(client._client, "request", return_value=mock_resp) as mock_req:
+        client.batch_search([BatchSearchQuery(q="test", k=5, tags=["alpha", "beta"])])
+
+    payload = mock_req.call_args.kwargs["json"]
+    assert payload["queries"][0]["tags"] == "alpha,beta"
