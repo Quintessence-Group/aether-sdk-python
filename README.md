@@ -1,11 +1,11 @@
-# aether-sdk
+# aether-ai
 
 Python SDK for the [Aether](https://aetherdb.ai) decentralized RAG API.
 
 ## Installation
 
 ```bash
-pip install aether-sdk
+pip install aether-ai
 ```
 
 ## Quick Start
