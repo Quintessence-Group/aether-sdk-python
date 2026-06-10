@@ -1,4 +1,4 @@
-# Contributing to aether-sdk
+# Contributing to aether-ai
 
 Thanks for your interest in improving the Python SDK for
 [Aether](https://aetherdb.ai)! Bug reports, fixes, docs, and features are all welcome.
