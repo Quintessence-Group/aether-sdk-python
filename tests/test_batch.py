@@ -97,3 +97,64 @@ def test_batch_search_tags_are_comma_joined_string(client):
 
     payload = mock_req.call_args.kwargs["json"]
     assert payload["queries"][0]["tags"] == "alpha,beta"
+
+
+def test_batch_insert_serializes_entity_id(client):
+    mock_resp = _ok_response()
+    mock_resp.json.return_value = {
+        "results": [
+            {"doc_id": "b1", "cid": "c1", "chunks": 2, "vectors": 2, "version": 1,
+             "entity_id": "user-123", "created_at": "2026-06-11T00:00:00Z"},
+            {"doc_id": "b2", "cid": "c2", "chunks": 1, "vectors": 1, "version": 1},
+        ],
+    }
+
+    with patch.object(client._client, "request", return_value=mock_resp) as mock_req:
+        results = client.batch_insert([
+            BatchInsertItem(filename="a.txt", content="hello", entity_id="user-123"),
+            BatchInsertItem(filename="b.txt", content="world"),
+        ])
+
+    payload = mock_req.call_args[1]["json"]
+    assert payload["documents"][0]["entity_id"] == "user-123"
+    assert "entity_id" not in payload["documents"][1]
+    # Mapper round-trips the full record returned by the server
+    assert results[0].entity_id == "user-123"
+    assert results[0].created_at == "2026-06-11T00:00:00Z"
+    assert results[1].entity_id is None
+
+
+def test_batch_search_serializes_filters(client):
+    mock_resp = _ok_response()
+    mock_resp.json.return_value = {
+        "results": [
+            {"query": "filtered", "results": []},
+            {"query": "recent", "results": []},
+            {"query": "plain", "results": []},
+        ],
+    }
+
+    with patch.object(client._client, "request", return_value=mock_resp) as mock_req:
+        client.batch_search([
+            BatchSearchQuery(
+                q="filtered",
+                k=5,
+                entity_id="user-123",
+                since="2026-06-01T00:00:00Z",
+                until="2026-06-10T23:59:59Z",
+                max_distance=0.3,
+            ),
+            BatchSearchQuery(q="recent", last_n_days=7),
+            BatchSearchQuery(q="plain"),
+        ])
+
+    queries = mock_req.call_args[1]["json"]["queries"]
+    assert queries[0]["entity_id"] == "user-123"
+    assert queries[0]["since"] == "2026-06-01T00:00:00Z"
+    assert queries[0]["until"] == "2026-06-10T23:59:59Z"
+    assert queries[0]["max_distance"] == 0.3
+    assert "last_n_days" not in queries[0]
+    assert queries[1]["last_n_days"] == 7
+    assert "since" not in queries[1]
+    for key in ("entity_id", "since", "until", "last_n_days", "max_distance"):
+        assert key not in queries[2]
