@@ -18,6 +18,7 @@ class DocumentRecord:
     version: int = 1
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    entity_id: Optional[str] = None
 
 
 @dataclass
@@ -74,6 +75,7 @@ class BatchInsertItem:
     filename: str
     content: str
     tags: Optional[list[str]] = None
+    entity_id: Optional[str] = None
 
 @dataclass
 class BatchSearchQuery:
@@ -81,8 +83,23 @@ class BatchSearchQuery:
     k: int = 10
     tags: Optional[list[str]] = None
     include_content: bool = False
+    entity_id: Optional[str] = None
+    since: Optional[str] = None
+    until: Optional[str] = None
+    last_n_days: Optional[int] = None
+    max_distance: Optional[float] = None
 
 @dataclass
 class BatchSearchResponse:
     query: str
     results: list[SearchResult]
+
+@dataclass
+class EntityBackfillReport:
+    """Counts returned by a tag-driven entity_id backfill run."""
+    scanned: int = 0
+    updated: int = 0
+    skipped_existing: int = 0
+    skipped_no_match: int = 0
+    skipped_ambiguous: int = 0
+    skipped_invalid: int = 0
