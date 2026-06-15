@@ -11,7 +11,7 @@ import uuid
 from typing import Optional
 from urllib.parse import urlparse
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 #: Sent on every request so the server can attribute traffic by SDK + version.
 USER_AGENT = (
