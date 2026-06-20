@@ -88,33 +88,32 @@ class AetherVectorStore(BasePydanticVectorStore):
         
         if query.query_embedding:
             results = self._client.search_by_vector(
-                embedding=query.query_embedding, 
-                k=k, 
-                include_content=True,
+                embedding=query.query_embedding,
+                k=k,
                 tags=tags_param
             )
         else:
             results = self._client.search(
-                query.query_str or "", 
-                k=k, 
-                include_content=True,
+                query.query_str or "",
+                k=k,
                 tags=tags_param
             )
 
         nodes = []
         similarities = []
         ids = []
-        
+
         for r in results:
-            content = r.content or r.passage or ""
+            # Search returns the matched passage, not full document text.
+            content = r.passage or ""
             # Reconstruct node object that LlamaIndex expects
             node = TextNode(
                 id_=r.doc_id,
                 text=content,
-                metadata={"title": r.title, "content_type": r.content_type, "distance": r.distance}
+                metadata={"title": r.title, "content_type": r.content_type, "score": r.score}
             )
             nodes.append(node)
-            similarities.append(1.0 - r.distance)  # Aether uses cosine distance; convert to similarity
+            similarities.append(r.score / 100.0)  # score is 0-100; normalize to 0-1
             ids.append(r.doc_id)
             
         return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)

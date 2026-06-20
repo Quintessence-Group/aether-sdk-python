@@ -66,7 +66,7 @@ def test_batch_search(client):
             {
                 "query": "test",
                 "results": [
-                    {"doc_id": "a", "distance": 0.1, "content_type": "text/plain"},
+                    {"doc_id": "a", "score": 90, "content_type": "text/plain"},
                 ],
             },
         ],

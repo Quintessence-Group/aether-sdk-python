@@ -47,8 +47,8 @@ class TestRetrieve:
         search_resp.json.return_value = {
             "query": "test",
             "results": [
-                {"doc_id": "doc-1", "distance": 0.1, "title": "Doc 1", "content_type": "text/plain"},
-                {"doc_id": "doc-2", "distance": 0.3, "title": "Doc 2", "content_type": "text/plain"},
+                {"doc_id": "doc-1", "score": 95, "title": "Doc 1", "content_type": "text/plain"},
+                {"doc_id": "doc-2", "score": 80, "title": "Doc 2", "content_type": "text/plain"},
             ],
         }
 
@@ -62,7 +62,7 @@ class TestRetrieve:
         assert isinstance(results[0], RetrievalResult)
         assert results[0].doc_id == "doc-1"
         assert results[0].content == "Content of doc 1"
-        assert results[0].distance == 0.1
+        assert results[0].score == 95
         assert results[1].content == "Content of doc 2"
 
     def test_deduplicates_by_doc_id(self, client):
@@ -70,9 +70,9 @@ class TestRetrieve:
         search_resp.json.return_value = {
             "query": "test",
             "results": [
-                {"doc_id": "doc-1", "distance": 0.1, "title": "Doc 1", "content_type": "text/plain"},
-                {"doc_id": "doc-1", "distance": 0.2, "title": "Doc 1", "content_type": "text/plain"},
-                {"doc_id": "doc-2", "distance": 0.3, "title": "Doc 2", "content_type": "text/plain"},
+                {"doc_id": "doc-1", "score": 95, "title": "Doc 1", "content_type": "text/plain"},
+                {"doc_id": "doc-1", "score": 90, "title": "Doc 1", "content_type": "text/plain"},
+                {"doc_id": "doc-2", "score": 80, "title": "Doc 2", "content_type": "text/plain"},
             ],
         }
 
@@ -84,7 +84,7 @@ class TestRetrieve:
 
         # Should deduplicate: 3 search results -> 2 unique docs
         assert len(results) == 2
-        assert results[0].distance == 0.1  # keeps closest match
+        assert results[0].score == 95  # keeps closest match
 
 
 def _wire_url(params: dict) -> str:
@@ -163,7 +163,7 @@ class TestSearchFilters:
             )
 
         params = mock_req.call_args[1]["params"]
-        assert params["include_content"] == "true"
+        assert "include_content" not in params
         assert params["entity_id"] == "user-123"
         assert params["since"] == "2026-06-01T00:00:00Z"
         assert params["until"] == "2026-06-10T23:59:59Z"

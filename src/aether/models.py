@@ -24,10 +24,12 @@ class DocumentRecord:
 @dataclass
 class SearchResult:
     doc_id: str
-    distance: float
+    #: Calibrated relevance, 0-100 (higher = better); ~100 for a near-exact match.
+    score: int
     title: Optional[str] = None
     content_type: str = "text/plain"
-    content: Optional[str] = None
+    #: The specific passage (chunk) that matched the query. Fetch the full
+    #: document text with ``download_text`` rather than inline.
     passage: Optional[str] = None
 
 
@@ -42,10 +44,12 @@ class NodeStatus:
 
 @dataclass
 class RetrievalResult:
-    """A search result enriched with document content for RAG workflows."""
+    """A search result enriched with full document content for RAG workflows."""
 
     doc_id: str
-    distance: float
+    #: Calibrated relevance, 0-100 (higher = better); ~100 for a near-exact match.
+    score: int
+    #: Full document content as text, for use in RAG prompts.
     content: str
     title: Optional[str] = None
     content_type: str = "text/plain"
@@ -82,7 +86,6 @@ class BatchSearchQuery:
     q: str
     k: int = 10
     tags: Optional[list[str]] = None
-    include_content: bool = False
     entity_id: Optional[str] = None
     since: Optional[str] = None
     until: Optional[str] = None
