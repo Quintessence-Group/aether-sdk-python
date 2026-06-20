@@ -31,6 +31,10 @@ class SearchResult:
     #: The specific passage (chunk) that matched the query. Fetch the full
     #: document text with ``download_text`` rather than inline.
     passage: Optional[str] = None
+    #: Identifier of the entity (e.g. user, customer) this document belongs to,
+    #: echoed back by the engine on every hit. ``None`` if the document has no
+    #: associated entity.
+    entity_id: Optional[str] = None
 
 
 @dataclass

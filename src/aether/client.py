@@ -644,6 +644,7 @@ class AetherClient:
                 title=r.get("title"),
                 content_type=r.get("content_type", ""),
                 passage=r.get("passage"),
+                entity_id=r.get("entity_id"),
             )
             for r in body.get("results", [])
         ]
@@ -737,6 +738,7 @@ class AetherClient:
                 doc_id=sr["doc_id"], score=sr["score"],
                 title=sr.get("title"), content_type=sr.get("content_type", ""),
                 passage=sr.get("passage"),
+                entity_id=sr.get("entity_id"),
             )
             for sr in r.get("results", [])
         ]
@@ -875,6 +877,7 @@ class AetherClient:
                         title=sr.get("title"),
                         content_type=sr.get("content_type", ""),
                         passage=sr.get("passage"),
+                        entity_id=sr.get("entity_id"),
                     )
                     for sr in r.get("results", [])
                 ],
