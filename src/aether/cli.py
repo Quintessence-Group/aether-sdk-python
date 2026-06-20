@@ -43,7 +43,7 @@ def search(
         typer.echo("No results found.")
         return
     for i, r in enumerate(results, 1):
-        typer.echo(f"  {i}. {r.doc_id} (distance: {r.distance:.4f}) - {r.title or 'untitled'}")
+        typer.echo(f"  {i}. {r.doc_id} (score: {r.score}) - {r.title or 'untitled'}")
 
 
 @app.command("list")

@@ -207,6 +207,9 @@ class AetherClient:
         return DocumentRecord(
             doc_id=body["doc_id"],
             cid=body["cid"],
+            title=body.get("title"),
+            content_type=body.get("content_type", ""),
+            size_bytes=body.get("size_bytes", 0),
             chunks=body["chunks"],
             vectors=body["vectors"],
             version=body["version"],
@@ -248,6 +251,9 @@ class AetherClient:
         return DocumentRecord(
             doc_id=body["doc_id"],
             cid=body["cid"],
+            title=body.get("title"),
+            content_type=body.get("content_type", ""),
+            size_bytes=body.get("size_bytes", 0),
             chunks=body["chunks"],
             vectors=body["vectors"],
             version=body["version"],
@@ -298,6 +304,9 @@ class AetherClient:
         return DocumentRecord(
             doc_id=body["doc_id"],
             cid=body["cid"],
+            title=body.get("title"),
+            content_type=body.get("content_type", ""),
+            size_bytes=body.get("size_bytes", 0),
             chunks=body["chunks"],
             vectors=body["vectors"],
             version=body["version"],
@@ -347,6 +356,9 @@ class AetherClient:
         return DocumentRecord(
             doc_id=body["doc_id"],
             cid=body["cid"],
+            title=body.get("title"),
+            content_type=body.get("content_type", ""),
+            size_bytes=body.get("size_bytes", 0),
             chunks=body["chunks"],
             vectors=body["vectors"],
             version=body["version"],
@@ -405,11 +417,12 @@ class AetherClient:
         last_n_days: int | None = None,
         max_distance: float | None = None,
     ) -> list[RetrievalResult]:
-        """Search and return results with document content included.
+        """Search and return results with full document content included.
 
         Combines search() + download_text() into a single call for RAG workflows.
-        Results are deduplicated by doc_id (closest match wins).
-        Uses server-side include_content when available, falling back to per-doc downloads.
+        Results are deduplicated by doc_id (closest match wins). Since search no
+        longer returns full document content, each unique document's text is
+        fetched by id and attached as ``content``.
 
         Args:
             query: Search query.
@@ -434,7 +447,6 @@ class AetherClient:
         results = self.search(
             query,
             k=k,
-            include_content=True,
             tags=tags,
             entity_id=entity_id,
             since=since,
@@ -449,13 +461,15 @@ class AetherClient:
             if r.doc_id not in seen:
                 seen[r.doc_id] = r
 
+        # Search returns only the matched passage now (never full document
+        # content), so fetch each unique document's text by id for RAG prompts.
         retrieval_results = []
         for r in seen.values():
-            content = r.content if r.content is not None else self.download_text(r.doc_id)
+            content = self.download_text(r.doc_id)
             retrieval_results.append(
                 RetrievalResult(
                     doc_id=r.doc_id,
-                    distance=r.distance,
+                    score=r.score,
                     content=content,
                     title=r.title,
                     content_type=r.content_type,
@@ -574,7 +588,6 @@ class AetherClient:
         self,
         query: str,
         k: int = 10,
-        include_content: bool = False,
         tags: list[str] | None = None,
         entity_id: str | None = None,
         since: str | None = None,
@@ -584,10 +597,13 @@ class AetherClient:
     ) -> list[SearchResult]:
         """Similarity search across documents.
 
+        Each hit carries the matched ``passage`` (by default) and a calibrated
+        ``score`` (0-100, higher = better). Full document text is never inlined;
+        use :py:meth:`retrieve` or :py:meth:`download_text` to fetch it.
+
         Args:
             query: Search query.
             k: Maximum number of results to return.
-            include_content: Include document text in each result.
             tags: Optional tag filter; results must carry all listed tags.
             entity_id: Only match documents associated with this entity id.
             since: Only match documents created at or after this RFC 3339
@@ -606,8 +622,6 @@ class AetherClient:
         if k < 1:
             raise ValueError("k must be at least 1")
         params: dict = {"q": query, "k": k}
-        if include_content:
-            params["include_content"] = "true"
         if tags:
             params["tags"] = ",".join(tags)
         if entity_id:
@@ -626,10 +640,9 @@ class AetherClient:
         return [
             SearchResult(
                 doc_id=r["doc_id"],
-                distance=r["distance"],
+                score=r["score"],
                 title=r.get("title"),
                 content_type=r.get("content_type", ""),
-                content=r.get("content"),
                 passage=r.get("passage"),
             )
             for r in body.get("results", [])
@@ -674,8 +687,10 @@ class AetherClient:
         self._raise_for_status(resp)
         r = resp.json()
         return DocumentRecord(
-            doc_id=r["doc_id"], cid=r["cid"], chunks=r["chunks"],
-            vectors=r["vectors"], version=r["version"],
+            doc_id=r["doc_id"], cid=r["cid"],
+            title=r.get("title"), content_type=r.get("content_type", ""),
+            size_bytes=r.get("size_bytes", 0),
+            chunks=r["chunks"], vectors=r["vectors"], version=r["version"],
             created_at=r.get("created_at"), updated_at=r.get("updated_at"),
             entity_id=r.get("entity_id"),
         )
@@ -684,7 +699,6 @@ class AetherClient:
         self,
         embedding: list[float],
         k: int = 10,
-        include_content: bool = False,
         tags: list[str] | None = None,
         entity_id: str | None = None,
         since: str | None = None,
@@ -694,14 +708,15 @@ class AetherClient:
     ) -> list[SearchResult]:
         """Search using a pre-computed query embedding.
 
-        See :py:meth:`search` for the semantics of the ``entity_id``, ``since``,
-        ``until``, ``last_n_days`` and ``max_distance`` filters.
+        See :py:meth:`search` for the result shape and the semantics of the
+        ``entity_id``, ``since``, ``until``, ``last_n_days`` and ``max_distance``
+        filters.
         """
         if not embedding:
             raise ValueError("embedding cannot be empty")
         if k < 1:
             raise ValueError("k must be at least 1")
-        body: dict = {"embedding": embedding, "k": k, "include_content": include_content}
+        body: dict = {"embedding": embedding, "k": k}
         if tags:
             body["tags"] = tags
         if entity_id:
@@ -719,9 +734,9 @@ class AetherClient:
         r = resp.json()
         return [
             SearchResult(
-                doc_id=sr["doc_id"], distance=sr["distance"],
+                doc_id=sr["doc_id"], score=sr["score"],
                 title=sr.get("title"), content_type=sr.get("content_type", ""),
-                content=sr.get("content"), passage=sr.get("passage"),
+                passage=sr.get("passage"),
             )
             for sr in r.get("results", [])
         ]
@@ -812,6 +827,9 @@ class AetherClient:
             DocumentRecord(
                 doc_id=r["doc_id"],
                 cid=r["cid"],
+                title=r.get("title"),
+                content_type=r.get("content_type", ""),
+                size_bytes=r.get("size_bytes", 0),
                 chunks=r["chunks"],
                 vectors=r["vectors"],
                 version=r["version"],
@@ -835,7 +853,6 @@ class AetherClient:
                     "q": q.q,
                     "k": q.k,
                     **({"tags": ",".join(q.tags)} if q.tags else {}),
-                    **({"include_content": q.include_content} if q.include_content else {}),
                     **({"entity_id": q.entity_id} if q.entity_id else {}),
                     **({"since": q.since} if q.since else {}),
                     **({"until": q.until} if q.until else {}),
@@ -854,10 +871,9 @@ class AetherClient:
                 results=[
                     SearchResult(
                         doc_id=sr["doc_id"],
-                        distance=sr["distance"],
+                        score=sr["score"],
                         title=sr.get("title"),
                         content_type=sr.get("content_type", ""),
-                        content=sr.get("content"),
                         passage=sr.get("passage"),
                     )
                     for sr in r.get("results", [])

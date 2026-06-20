@@ -92,16 +92,17 @@ class AetherVectorStore(VectorStore):
         
         if self.embedding is not None:
             emb = self.embedding.embed_query(query)
-            results = self.client.search_by_vector(emb, k=k, include_content=True, tags=tags)
+            results = self.client.search_by_vector(emb, k=k, tags=tags)
         else:
-            results = self.client.search(query, k=k, include_content=True, tags=tags)
-            
+            results = self.client.search(query, k=k, tags=tags)
+
         docs = []
         for r in results:
-            content = r.content or r.passage or ""
+            # Search returns the matched passage, not full document text.
+            content = r.passage or ""
             metadata = {
-                "doc_id": r.doc_id, 
-                "distance": r.distance, 
+                "doc_id": r.doc_id,
+                "score": r.score,
                 "title": r.title
             }
             if r.content_type:

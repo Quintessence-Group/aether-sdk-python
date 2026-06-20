@@ -25,7 +25,7 @@ doc = client.insert_text("Some text content to index")
 # Search
 results = client.search("machine learning", k=5)
 for r in results:
-    print(f"  {r.doc_id} (distance: {r.distance:.3f})")
+    print(f"  {r.doc_id} (score: {r.score}) - {r.passage}")
 
 # List documents
 for doc in client.list():

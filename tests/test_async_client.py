@@ -37,53 +37,33 @@ async def test_download_text(client):
 
 
 @pytest.mark.asyncio
-async def test_search_with_include_content(client):
+async def test_search_returns_score_and_passage(client):
     mock_resp = make_async_response(json_data={
         "query": "test",
         "results": [
-            {"doc_id": "doc-1", "distance": 0.1, "title": "Doc 1",
-             "content_type": "text/plain", "content": "Inline content"},
+            {"doc_id": "doc-1", "score": 92, "title": "Doc 1",
+             "content_type": "text/plain", "passage": "Matched passage"},
         ],
     })
 
     with patch.object(client._client, "request", new_callable=AsyncMock, return_value=mock_resp):
-        results = await client.search("test", k=5, include_content=True)
+        results = await client.search("test", k=5)
 
     assert len(results) == 1
-    assert results[0].content == "Inline content"
+    assert results[0].score == 92
+    assert results[0].passage == "Matched passage"
 
 
 @pytest.mark.asyncio
-async def test_retrieve_with_inline_content(client):
-    """When server provides content inline, no downloads needed."""
+async def test_retrieve_downloads_full_content(client):
+    """retrieve() always fetches each unique doc's full text by id."""
     search_resp = make_async_response(json_data={
         "query": "test",
         "results": [
-            {"doc_id": "doc-1", "distance": 0.1, "title": "Doc 1",
-             "content_type": "text/plain", "content": "Content 1", "passage": "Passage 1"},
-            {"doc_id": "doc-2", "distance": 0.3, "title": "Doc 2",
-             "content_type": "text/plain", "content": "Content 2", "passage": None},
-        ],
-    })
-
-    with patch.object(client._client, "request", new_callable=AsyncMock, return_value=search_resp):
-        results = await client.retrieve("test query", k=5)
-
-    assert len(results) == 2
-    assert isinstance(results[0], RetrievalResult)
-    assert results[0].content == "Content 1"
-    assert results[0].passage == "Passage 1"
-    assert results[1].content == "Content 2"
-
-
-@pytest.mark.asyncio
-async def test_retrieve_fallback_to_download(client):
-    """When server doesn't include content, falls back to parallel downloads."""
-    search_resp = make_async_response(json_data={
-        "query": "test",
-        "results": [
-            {"doc_id": "doc-1", "distance": 0.1, "title": "Doc 1", "content_type": "text/plain"},
-            {"doc_id": "doc-2", "distance": 0.3, "title": "Doc 2", "content_type": "text/plain"},
+            {"doc_id": "doc-1", "score": 95, "title": "Doc 1",
+             "content_type": "text/plain", "passage": "Passage 1"},
+            {"doc_id": "doc-2", "score": 80, "title": "Doc 2",
+             "content_type": "text/plain", "passage": None},
         ],
     })
     dl_resp_1 = make_async_response(content=b"Downloaded 1")
@@ -93,10 +73,13 @@ async def test_retrieve_fallback_to_download(client):
         client._client, "request", new_callable=AsyncMock,
         side_effect=[search_resp, dl_resp_1, dl_resp_2],
     ):
-        results = await client.retrieve("test", k=5)
+        results = await client.retrieve("test query", k=5)
 
     assert len(results) == 2
+    assert isinstance(results[0], RetrievalResult)
     assert results[0].content == "Downloaded 1"
+    assert results[0].passage == "Passage 1"
+    assert results[0].score == 95
     assert results[1].content == "Downloaded 2"
 
 
@@ -130,17 +113,22 @@ async def test_retrieve_deduplicates(client):
     search_resp = make_async_response(json_data={
         "query": "test",
         "results": [
-            {"doc_id": "doc-1", "distance": 0.1, "content_type": "text/plain", "content": "C1"},
-            {"doc_id": "doc-1", "distance": 0.2, "content_type": "text/plain", "content": "C1"},
-            {"doc_id": "doc-2", "distance": 0.3, "content_type": "text/plain", "content": "C2"},
+            {"doc_id": "doc-1", "score": 95, "content_type": "text/plain", "passage": "P1"},
+            {"doc_id": "doc-1", "score": 90, "content_type": "text/plain", "passage": "P1"},
+            {"doc_id": "doc-2", "score": 80, "content_type": "text/plain", "passage": "P2"},
         ],
     })
+    dl_resp_1 = make_async_response(content=b"C1")
+    dl_resp_2 = make_async_response(content=b"C2")
 
-    with patch.object(client._client, "request", new_callable=AsyncMock, return_value=search_resp):
+    with patch.object(
+        client._client, "request", new_callable=AsyncMock,
+        side_effect=[search_resp, dl_resp_1, dl_resp_2],
+    ):
         results = await client.retrieve("test", k=5)
 
     assert len(results) == 2
-    assert results[0].distance == 0.1
+    assert results[0].score == 95
 
 
 @pytest.mark.asyncio
@@ -260,7 +248,7 @@ async def test_retrieve_forwards_filters(client):
         )
 
     params = mock_req.call_args[1]["params"]
-    assert params["include_content"] == "true"
+    assert "include_content" not in params
     assert params["entity_id"] == "user-123"
     assert params["since"] == "2026-06-01T00:00:00Z"
     assert params["until"] == "2026-06-10T23:59:59Z"

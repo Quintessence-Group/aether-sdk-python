@@ -23,6 +23,7 @@ from .models import (
     RetrievalResult,
     SearchResult,
 )
+from .rag import format_context
 
 __all__ = [
     "__version__",
@@ -44,4 +45,5 @@ __all__ = [
     "SearchResult",
     "RetrievalResult",
     "NodeStatus",
+    "format_context",
 ]
