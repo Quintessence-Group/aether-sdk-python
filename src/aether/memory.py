@@ -1,4 +1,4 @@
-"""Entity-scoped ``Memory`` facade over the Aether raw client (AET-145).
+"""Entity-scoped ``Memory`` facade over the Aether raw client.
 
 ``Memory`` is a thin, ergonomic wrapper around :class:`~aether.AetherClient`
 (and ``AsyncMemory`` around :class:`~aether.AsyncAetherClient`). Construct it
@@ -27,7 +27,7 @@ from .client import AetherClient
 OVERFETCH = 4
 MAX_CANDIDATES = 100
 
-# entity_id constraint mirrors the server (AET-146): 1–256 chars.
+# entity_id constraint mirrors the server: 1–256 chars.
 _MAX_ENTITY_ID_LEN = 256
 
 # Metadata values are strings only in v1 (MEMORY_CONTRACT.md §3): numeric/float

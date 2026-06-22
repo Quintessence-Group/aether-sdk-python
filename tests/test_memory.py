@@ -1,4 +1,4 @@
-"""Contract test for the ``Memory`` / ``AsyncMemory`` facade (AET-145).
+"""Contract test for the ``Memory`` / ``AsyncMemory`` facade.
 
 Mocked at the same transport layer as the existing client tests
 (``client._client.request``) with the *real* raw client underneath, constructed

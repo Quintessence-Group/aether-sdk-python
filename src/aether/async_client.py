@@ -542,9 +542,8 @@ class AsyncAetherClient:
                 timestamp. Inclusive.
             last_n_days: Only match documents created in the last N days.
                 Cannot be combined with ``since``.
-            max_distance: Optional cosine-distance ceiling. Results with
-                ``distance > max_distance`` are dropped server-side, after
-                reranking. Omit (or pass ``None``) to return the top-k regardless
+            max_distance: Optional relevance-distance ceiling. Results with
+                ``distance > max_distance`` are dropped server-side. Omit (or pass ``None``) to return the top-k regardless
                 of distance — the historical behavior.
         """
         if not query:
