@@ -56,7 +56,7 @@ def test_insert_text_populates_size_bytes(client):
 
 def test_insert_with_embeddings_populates_size_bytes(client):
     with patch.object(client._client, "request", return_value=_resp(FULL)):
-        _assert_full(client.insert_with_embeddings("content", embedding=[0.0] * 384))
+        _assert_full(client.insert_with_embeddings("content", embedding=[0.0] * 8))
 
 
 def test_batch_insert_populates_size_bytes(client):
