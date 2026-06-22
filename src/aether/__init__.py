@@ -12,6 +12,7 @@ from .errors import (
     TenantPausedError,
     aether_api_error_from_response,
 )
+from .memory import AsyncMemory, Memory, MemoryItem
 from .models import (
     BatchInsertItem,
     BatchSearchQuery,
@@ -29,6 +30,9 @@ __all__ = [
     "__version__",
     "AetherClient",
     "AsyncAetherClient",
+    "Memory",
+    "AsyncMemory",
+    "MemoryItem",
     "AetherError",
     "AetherApiError",
     "AetherNetworkError",

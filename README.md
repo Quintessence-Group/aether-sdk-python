@@ -8,6 +8,38 @@ Python SDK for the [Aether](https://aetherdb.ai) decentralized RAG API.
 pip install aether-ai
 ```
 
+## Memory — the fastest way to build agent memory
+
+For per-user or per-agent memory, reach for the `Memory` facade. Construct it once
+with an entity id and every call is automatically scoped to that entity — no tags or
+filters to manage:
+
+```python
+from aether import Memory
+
+mem = Memory("patient-john", api_key="aether_your_key_here")
+
+# Store a memory
+mem.remember("Anxious about flying; uses 4-7-8 breathing")
+
+# Recall the most relevant memories for this entity
+for item in mem.recall("anxiety coping"):
+    print(item.score, item.text)
+
+# Newest-first history, or wipe the slate
+mem.list(limit=20)
+mem.forget_all()
+```
+
+- `recall(query, k=5, recency_weight=0.0, since=..., until=...)` blends relevance
+  (a calibrated `score`, 0–100) with optional exponential recency decay.
+- `remember(text, metadata={...})` stores the memory and writes `metadata` as
+  searchable `key:value` tags.
+- `AsyncMemory` mirrors the same surface with `await` on every call.
+
+The raw `AetherClient` below is the lower-level API — use it when you need direct
+control over documents, search, and batch operations rather than entity-scoped memory.
+
 ## Quick Start
 
 ```python
