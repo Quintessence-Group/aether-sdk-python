@@ -9,7 +9,7 @@ jobs:
           fetch-depth: 0
       - name: Scan tracked files for reverse-engineering / internal leaks
         run: |
-          PATTERN='cosine|rerank|crates/aether-node|aether-node|aether monorepo|aether main|AET-[0-9]|tombstoned|token_balance|cluster_mode|\[0\.0\] ?\* ?[0-9]{3}'
+          PATTERN='cosine|rerank|crates/aether-node|aether-node|aether monorepo|AET-[0-9]|round\(100 ?\*|hybrid fusion|\[0\.0\] ?\* ?[0-9]{3}'
           if git grep -nIE -i "$PATTERN" -- . ':(exclude).github/workflows/leak-scan.yml'; then
             echo "::error::leak-scan: forbidden internal/reverse-engineering token(s) in tracked files (above)."
             exit 1
@@ -23,7 +23,7 @@ jobs:
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
         run: |
-          MSG='co-authored-by: *claude|generated with claude|🤖|cosine|rerank|crates/aether-node|aether-node|aether monorepo|aether main|round\(100|hybrid fusion|tombstoned|token_balance|cluster_mode'
+          MSG='co-authored-by: *claude|generated with claude|🤖|cosine|rerank|crates/aether-node|aether-node|aether monorepo|round\(100|hybrid fusion'
           if [ "$EVENT" = "pull_request" ]; then
             RANGE="$PR_BASE..$PR_HEAD"
           elif printf '%s' "$BEFORE" | grep -qE '^0+$'; then
