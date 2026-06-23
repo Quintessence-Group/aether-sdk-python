@@ -5,11 +5,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Scan tracked files for reverse-engineering / internal leaks
         run: |
           PATTERN='cosine|rerank|crates/aether-node|aether-node|aether monorepo|aether main|AET-[0-9]|tombstoned|token_balance|cluster_mode|\[0\.0\] ?\* ?[0-9]{3}'
           if git grep -nIE -i "$PATTERN" -- . ':(exclude).github/workflows/leak-scan.yml'; then
-            echo "::error::leak-scan: forbidden internal/reverse-engineering token(s) found above."
+            echo "::error::leak-scan: forbidden internal/reverse-engineering token(s) in tracked files (above)."
             exit 1
           fi
-          echo "leak-scan: clean"
+          echo "leak-scan (files): clean"
+      - name: Scan commit messages for attribution / internal leaks
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          MSG='co-authored-by: *claude|generated with claude|🤖|cosine|rerank|crates/aether-node|aether-node|aether monorepo|aether main|round\(100|hybrid fusion|tombstoned|token_balance|cluster_mode'
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="$PR_BASE..$PR_HEAD"
+          elif printf '%s' "$BEFORE" | grep -qE '^0+$'; then
+            RANGE="$AFTER~1..$AFTER"
+          else
+            RANGE="$BEFORE..$AFTER"
+          fi
+          MSGS=$(git log "$RANGE" --format='%B' 2>/dev/null) || MSGS=$(git log -1 --format='%B' "$AFTER")
+          if printf '%s\n' "$MSGS" | grep -niE "$MSG"; then
+            echo "::error::leak-scan: forbidden attribution/internal token(s) in commit message(s) above."
+            exit 1
+          fi
+          echo "leak-scan (messages): clean"
