@@ -3,16 +3,26 @@
 from ._internal import __version__
 from .async_client import AsyncAetherClient
 from .client import AetherClient
+from .importers import Mem0ImportReport, import_mem0
+from .memory import (
+    AsyncMemory,
+    ConsolidationReport,
+    Memory,
+    MemoryEntity,
+    MemoryFact,
+    MemoryItem,
+    MemoryRelationship,
+)
 from .errors import (
     AetherApiError,
     AetherError,
     AetherNetworkError,
     CreditExhaustedError,
     FreeLimitExceededError,
+    PartitionRequiredError,
     TenantPausedError,
     aether_api_error_from_response,
 )
-from .memory import AsyncMemory, Memory, MemoryItem
 from .models import (
     BatchInsertItem,
     BatchSearchQuery,
@@ -20,9 +30,19 @@ from .models import (
     DocumentPage,
     DocumentRecord,
     EntityBackfillReport,
+    IngestResult,
+    IsolationCheck,
+    Metadata,
+    MetadataFilter,
+    MetadataValue,
     NodeStatus,
+    PartitionInfo,
+    PartitionList,
+    PartitionWarning,
     RetrievalResult,
     SearchResult,
+    SearchTrace,
+    TracedSearch,
 )
 from .rag import format_context
 
@@ -30,14 +50,12 @@ __all__ = [
     "__version__",
     "AetherClient",
     "AsyncAetherClient",
-    "Memory",
-    "AsyncMemory",
-    "MemoryItem",
     "AetherError",
     "AetherApiError",
     "AetherNetworkError",
     "CreditExhaustedError",
     "FreeLimitExceededError",
+    "PartitionRequiredError",
     "TenantPausedError",
     "aether_api_error_from_response",
     "BatchInsertItem",
@@ -46,8 +64,27 @@ __all__ = [
     "DocumentPage",
     "DocumentRecord",
     "EntityBackfillReport",
+    "IngestResult",
     "SearchResult",
     "RetrievalResult",
     "NodeStatus",
+    "PartitionInfo",
+    "PartitionList",
+    "PartitionWarning",
+    "SearchTrace",
+    "TracedSearch",
+    "IsolationCheck",
+    "Metadata",
+    "MetadataFilter",
+    "MetadataValue",
+    "Memory",
+    "AsyncMemory",
+    "MemoryItem",
+    "MemoryEntity",
+    "MemoryRelationship",
+    "MemoryFact",
+    "ConsolidationReport",
+    "Mem0ImportReport",
+    "import_mem0",
     "format_context",
 ]

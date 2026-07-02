@@ -73,7 +73,7 @@ class TestNoRetryOnClientError:
 
         with patch.object(client._client, "request", return_value=resp) as mock:
             with pytest.raises(AetherApiError) as exc_info:
-                client._request_with_retry("GET", "/documents/missing")
+                client._request_with_retry("GET", "/v1/documents/missing")
 
         assert mock.call_count == 1
         assert exc_info.value.status_code == 404
@@ -83,7 +83,7 @@ class TestNoRetryOnClientError:
 
         with patch.object(client._client, "request", return_value=resp) as mock:
             with pytest.raises(AetherApiError):
-                client._request_with_retry("GET", "/documents")
+                client._request_with_retry("GET", "/v1/documents")
 
         assert mock.call_count == 1
 
@@ -96,7 +96,7 @@ class TestRetryOnNetworkError:
             client._client, "request",
             side_effect=[httpx.TimeoutException("timed out"), ok],
         ) as mock:
-            resp = client._request_with_retry("POST", "/documents")
+            resp = client._request_with_retry("POST", "/v1/documents")
 
         assert resp.status_code == 200
         assert mock.call_count == 2
@@ -128,7 +128,7 @@ class TestRetryOn429:
         ok = _ok_response()
 
         with patch.object(client._client, "request", side_effect=[rate_resp, ok]) as mock:
-            resp = client._request_with_retry("GET", "/search")
+            resp = client._request_with_retry("GET", "/v1/search")
 
         assert resp.status_code == 200
         assert mock.call_count == 2
