@@ -88,24 +88,25 @@ class AetherVectorStore(BasePydanticVectorStore):
         
         if query.query_embedding:
             results = self._client.search_by_vector(
-                embedding=query.query_embedding,
-                k=k,
+                embedding=query.query_embedding, 
+                k=k, 
+                include_content=True,
                 tags=tags_param
             )
         else:
             results = self._client.search(
-                query.query_str or "",
-                k=k,
+                query.query_str or "", 
+                k=k, 
+                include_content=True,
                 tags=tags_param
             )
 
         nodes = []
         similarities = []
         ids = []
-
+        
         for r in results:
-            # Search returns the matched passage, not full document text.
-            content = r.passage or ""
+            content = r.content or r.passage or ""
             # Reconstruct node object that LlamaIndex expects
             node = TextNode(
                 id_=r.doc_id,

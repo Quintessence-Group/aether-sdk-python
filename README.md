@@ -31,8 +31,9 @@ mem.list(limit=20)
 mem.forget_all()
 ```
 
-- `recall(query, k=5, recency_weight=0.0, since=..., until=...)` blends relevance
-  (a calibrated `score`, 0–100) with optional exponential recency decay.
+- `recall(query, k=5, recency_weight=0.0, since=..., until=..., filter=...)` blends
+  relevance (a `score` in `(0, 1]`, higher is better) with optional exponential
+  recency decay, and can filter on the metadata you stored.
 - `remember(text, metadata={...})` stores the memory and writes `metadata` as
   searchable `key:value` tags.
 - `AsyncMemory` mirrors the same surface with `await` on every call.

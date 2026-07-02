@@ -8,10 +8,36 @@ from __future__ import annotations
 import ipaddress
 import platform
 import uuid
+from importlib.metadata import PackageNotFoundError, version as _dist_version
 from typing import Optional
 from urllib.parse import urlparse
 
-__version__ = "0.3.2"
+
+def _detect_version() -> str:
+    """Resolve the installed SDK version from package metadata.
+
+    Prefers the distribution that actually provides the ``aether`` import
+    package (Python 3.10+), then falls back to the known distribution names,
+    then to a neutral placeholder for source checkouts that were never
+    installed.
+    """
+    candidates: list[str] = []
+    try:  # Python 3.10+
+        from importlib.metadata import packages_distributions
+
+        candidates.extend(packages_distributions().get("aether") or [])
+    except ImportError:
+        pass
+    candidates.extend(("aether-ai", "aether-sdk"))
+    for dist in candidates:
+        try:
+            return _dist_version(dist)
+        except PackageNotFoundError:
+            continue
+    return "0.0.0"
+
+
+__version__ = _detect_version()
 
 #: Sent on every request so the server can attribute traffic by SDK + version.
 USER_AGENT = (

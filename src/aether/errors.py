@@ -65,6 +65,15 @@ class TenantPausedError(AetherApiError):
     """
 
 
+class PartitionRequiredError(AetherApiError):
+    """Raised when a multi-tenant key makes an unscoped call (HTTP 400,
+    ``code="partition_required"``). The key requires every read/write to name
+    a partition; scope the call through a partition handle —
+    ``client.partition("<end-client-id>")`` — instead of the top-level client.
+    Not retryable: it is a programming error, not a transient failure.
+    """
+
+
 def aether_api_error_from_response(
     status_code: int,
     message: str,
@@ -83,6 +92,8 @@ def aether_api_error_from_response(
         cls = FreeLimitExceededError
     elif status_code == 403 and error_code == "tenant_paused":
         cls = TenantPausedError
+    elif status_code == 400 and error_code == "partition_required":
+        cls = PartitionRequiredError
     else:
         cls = AetherApiError
     return cls(

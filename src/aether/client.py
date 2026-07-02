@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import mimetypes
 import os
 import random
@@ -14,6 +16,50 @@ import httpx
 
 from ._internal import USER_AGENT, enforce_secure_base_url, new_idempotency_key
 from .errors import AetherApiError, AetherNetworkError, aether_api_error_from_response
+
+# A partition id must be non-empty and at most this many characters, matching
+# the server's constraint. Validated client-side before any HTTP call.
+_MAX_PARTITION_LEN = 256
+
+# Canonical public API version prefix. Every data route (documents, search,
+# memory, partitions, archive) is served under this prefix. The public probe
+# route ``GET /status`` is intentionally unversioned.
+_API_VERSION_PREFIX = "/v1"
+_UNVERSIONED_PATHS = frozenset({"/status"})
+
+
+def _versioned_path(url: str) -> str:
+    """Prefix a relative request path with the public API version.
+
+    The prefix always goes before the path itself, never into the query
+    string. Unversioned probe routes (``/status``) pass through untouched.
+    """
+    path = url.split("?", 1)[0]
+    if path in _UNVERSIONED_PATHS:
+        return url
+    return _API_VERSION_PREFIX + url
+
+
+def _json_query_value(value: object) -> str:
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _validate_partition(partition_id: str) -> str:
+    """Validate a partition id client-side (never a network round-trip).
+
+    Mirrors the entity_id validation style: reject empty/whitespace-only ids
+    and ids longer than 256 characters with a ``ValueError``.
+    """
+    if not isinstance(partition_id, str) or not partition_id.strip():
+        raise ValueError("partition cannot be empty")
+    if len(partition_id) > _MAX_PARTITION_LEN:
+        raise ValueError(
+            f"partition must be at most {_MAX_PARTITION_LEN} characters "
+            f"(got {len(partition_id)})"
+        )
+    return partition_id
+
+
 from .models import (
     BatchInsertItem,
     BatchSearchQuery,
@@ -21,9 +67,19 @@ from .models import (
     DocumentPage,
     DocumentRecord,
     EntityBackfillReport,
+    IngestResult,
+    IsolationCheck,
+    Metadata,
+    MetadataFilter,
     NodeStatus,
+    resolve_content_type,
+    PartitionInfo,
+    PartitionList,
+    PartitionWarning,
     RetrievalResult,
     SearchResult,
+    SearchTrace,
+    TracedSearch,
 )
 
 
@@ -58,6 +114,38 @@ class AetherClient:
         self._client = httpx.Client(base_url=self.base_url, timeout=timeout, headers=headers)
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
+        # Partition scope: None on the base client (unscoped). Set on a
+        # scoped clone produced by ``partition()``. When set it is injected into
+        # every partition-aware read/write so a partition can never be forgotten.
+        self._partition: Optional[str] = None
+        # Ownership: the base client owns and closes the transport; a scoped
+        # clone shares it and must not close it (mirrors the Memory facade's
+        # ``_owns_client`` pattern).
+        self._owns_transport = True
+
+    def partition(self, partition_id: str) -> "AetherClient":
+        """Return a partition-scoped clone of this client.
+
+        Every read and write on the returned handle is automatically scoped to
+        ``partition_id`` — there is no per-call partition argument, so the scope
+        cannot be forgotten. Reaching a different partition requires obtaining a
+        separate handle via another ``partition()`` call. The top-level client
+        stays unscoped and behaves exactly as before.
+
+        A multi-tenant key requires a partition on every call; an unscoped call
+        under such a key is rejected by the server. Under a single-tenant key,
+        unscoped calls operate on the default partition.
+
+        The clone shares this client's transport and all configuration (base
+        url, auth, timeout, retries, backoff). It does **not** own the transport:
+        closing the clone is a no-op, and the base client still closes it.
+        Re-scoping is allowed — ``client.partition("a").partition("b")`` yields a
+        handle scoped to ``"b"``.
+        """
+        scoped = copy.copy(self)
+        scoped._partition = _validate_partition(partition_id)
+        scoped._owns_transport = False
+        return scoped
 
     def _raise_for_status(self, resp: httpx.Response) -> None:
         """Raise AetherApiError or AetherNetworkError for non-2xx responses."""
@@ -81,8 +169,13 @@ class AetherClient:
         )
 
     def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """Send a single HTTP request (no retries)."""
-        return self._client.request(method, url, **kwargs)
+        """Send a single HTTP request (no retries).
+
+        The relative *url* is rewritten under the ``/v1`` API version prefix
+        here, at the transport boundary, so every caller (including the
+        Memory facade) versions its data routes in one place.
+        """
+        return self._client.request(method, _versioned_path(url), **kwargs)
 
     def _request_with_retry(self, method: str, url: str, **kwargs) -> httpx.Response:
         """Send an HTTP request with exponential backoff retry for transient errors."""
@@ -153,7 +246,13 @@ class AetherClient:
         raise AetherNetworkError(f"Request failed after {max_attempts} attempts")
 
     def close(self):
-        self._client.close()
+        """Close the underlying transport.
+
+        A no-op on a partition-scoped clone, which shares (but does not own) the
+        base client's transport — only the base client closes it.
+        """
+        if self._owns_transport:
+            self._client.close()
 
     def __enter__(self):
         return self
@@ -163,6 +262,30 @@ class AetherClient:
 
     # ── Documents ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _parse_document_record(d: dict) -> DocumentRecord:
+        """Map a document JSON object to a :class:`DocumentRecord`.
+
+        New optional fields default so payloads from older servers (which omit
+        them) still parse: ``tags`` -> ``[]``, ``source`` -> ``None``.
+        """
+        return DocumentRecord(
+            doc_id=d["doc_id"],
+            cid=d.get("cid", ""),
+            title=d.get("title"),
+            content_type=d.get("content_type", ""),
+            size_bytes=d.get("size_bytes", 0),
+            chunks=d.get("chunks", 0),
+            vectors=d.get("vectors", 0),
+            version=d.get("version", 1),
+            created_at=d.get("created_at"),
+            updated_at=d.get("updated_at"),
+            entity_id=d.get("entity_id"),
+            tags=list(d.get("tags") or []),
+            source=d.get("source"),
+            metadata=dict(d.get("metadata") or {}),
+        )
+
     def insert(
         self,
         file_path: str | Path,
@@ -171,6 +294,8 @@ class AetherClient:
         chunk_size: int | None = None,
         overlap: int | None = None,
         entity_id: str | None = None,
+        source: str | None = None,
+        metadata: Metadata | None = None,
     ) -> DocumentRecord:
         """Insert a document from a file path.
 
@@ -180,6 +305,9 @@ class AetherClient:
 
         Pass *entity_id* to associate the document with an entity (e.g. a
         user or customer id) for later filtering on search and list.
+
+        Pass *source* to tag the document with its origin (e.g. a system or
+        channel name) for later filtering on search and list.
         """
         if chunk_size is not None and chunk_size < 1:
             raise ValueError("chunk_size must be at least 1")
@@ -200,22 +328,135 @@ class AetherClient:
             url += f"&overlap={overlap}"
         if entity_id:
             url += f"&entity_id={quote(entity_id)}"
+        if source:
+            url += f"&source={quote(source)}"
+        if metadata is not None:
+            url += f"&metadata={quote(_json_query_value(metadata))}"
+        if self._partition:
+            url += f"&partition={quote(self._partition)}"
 
         resp = self._request_with_retry("POST", url, content=data)
         self._raise_for_status(resp)
         body = resp.json()
-        return DocumentRecord(
-            doc_id=body["doc_id"],
-            cid=body["cid"],
-            title=body.get("title"),
-            content_type=body.get("content_type", ""),
-            size_bytes=body.get("size_bytes", 0),
-            chunks=body["chunks"],
-            vectors=body["vectors"],
-            version=body["version"],
-            created_at=body.get("created_at"),
-            updated_at=body.get("updated_at"),
-            entity_id=body.get("entity_id"),
+        return self._parse_document_record(body)
+
+    def ingest_files(
+        self,
+        paths: "list[str | Path]",
+        *,
+        tags: list[str] | None = None,
+        chunk_size: int | None = None,
+        overlap: int | None = None,
+        entity_id: str | None = None,
+        source: str | None = None,
+        metadata: Metadata | None = None,
+        raise_on_error: bool = False,
+    ) -> list[IngestResult]:
+        """Ingest many files in one call.
+
+        Each file is inserted independently with :meth:`insert`; the content
+        type is resolved from the extension (``.md`` / ``.txt`` / ``.pdf`` and
+        friends). Chunking uses the server defaults unless *chunk_size* /
+        *overlap* are given.
+
+        A file the engine cannot ingest — an unsupported or binary type, or one
+        that needs the server-side document parser when it is not configured, or
+        a file over the size limit — is **reported** in the returned results
+        (``status="skipped"``) rather than aborting the batch or failing
+        silently. Set ``raise_on_error=True`` to re-raise instead.
+
+        Returns one :class:`IngestResult` per input path, in order.
+        """
+        results: list[IngestResult] = []
+        for p in paths:
+            path = Path(p)
+            content_type = resolve_content_type(path)
+            try:
+                record = self.insert(
+                    path,
+                    content_type=content_type,
+                    tags=tags,
+                    chunk_size=chunk_size,
+                    overlap=overlap,
+                    entity_id=entity_id,
+                    source=source,
+                    metadata=metadata,
+                )
+                results.append(
+                    IngestResult(
+                        path=str(path),
+                        status="ingested",
+                        doc_id=record.doc_id,
+                        content_type=content_type,
+                    )
+                )
+            except AetherApiError as e:
+                if raise_on_error:
+                    raise
+                # 413 (too large) / 415 (unsupported media) / 422 (unprocessable
+                # — unknown or binary type the parser can't handle) are per-file
+                # rejections the caller can't fix by retrying: report, don't abort.
+                status = "skipped" if e.status_code in (413, 415, 422) else "error"
+                results.append(
+                    IngestResult(
+                        path=str(path),
+                        status=status,
+                        content_type=content_type,
+                        error=str(e),
+                    )
+                )
+            except OSError as e:
+                if raise_on_error:
+                    raise
+                results.append(
+                    IngestResult(path=str(path), status="error", error=str(e))
+                )
+        return results
+
+    def ingest_directory(
+        self,
+        directory: str | Path,
+        *,
+        extensions: list[str] | None = None,
+        recursive: bool = True,
+        tags: list[str] | None = None,
+        chunk_size: int | None = None,
+        overlap: int | None = None,
+        entity_id: str | None = None,
+        source: str | None = None,
+        metadata: Metadata | None = None,
+        raise_on_error: bool = False,
+    ) -> list[IngestResult]:
+        """Ingest every file under *directory*.
+
+        Walks *directory* (recursively by default) and ingests each file via
+        :meth:`ingest_files`. Pass *extensions* (e.g. ``[".md", ".txt", ".pdf"]``)
+        to restrict which files are loaded; leading dots and case are optional.
+        See :meth:`ingest_files` for how unsupported files are reported.
+        """
+        base = Path(directory)
+        if not base.is_dir():
+            raise ValueError(f"not a directory: {directory}")
+        allowed: set[str] | None = None
+        if extensions is not None:
+            allowed = {
+                (e if e.startswith(".") else f".{e}").lower() for e in extensions
+            }
+        walker = base.rglob("*") if recursive else base.glob("*")
+        files = sorted(
+            p
+            for p in walker
+            if p.is_file() and (allowed is None or p.suffix.lower() in allowed)
+        )
+        return self.ingest_files(
+            files,
+            tags=tags,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            entity_id=entity_id,
+            source=source,
+            metadata=metadata,
+            raise_on_error=raise_on_error,
         )
 
     def insert_text(
@@ -226,11 +467,22 @@ class AetherClient:
         chunk_size: int | None = None,
         overlap: int | None = None,
         entity_id: str | None = None,
+        source: str | None = None,
+        metadata: Metadata | None = None,
+        extract_facts: bool = False,
     ) -> DocumentRecord:
         """Insert raw text content.
 
         Pass *entity_id* to associate the document with an entity (e.g. a
         user or customer id) for later filtering on search and list.
+
+        Pass *source* to tag the document with its origin (e.g. a system or
+        channel name) for later filtering on search and list.
+
+        Pass ``extract_facts=True`` to also distill the text into atomic facts
+        server-side; each fact is stored as a sibling document tagged
+        ``kind:fact`` and linked to this document. Requires fact extraction to
+        be configured on the node, otherwise the request fails.
         """
         if chunk_size is not None and chunk_size < 1:
             raise ValueError("chunk_size must be at least 1")
@@ -245,22 +497,18 @@ class AetherClient:
             url += f"&overlap={overlap}"
         if entity_id:
             url += f"&entity_id={quote(entity_id)}"
+        if source:
+            url += f"&source={quote(source)}"
+        if metadata is not None:
+            url += f"&metadata={quote(_json_query_value(metadata))}"
+        if extract_facts:
+            url += "&extract_facts=true"
+        if self._partition:
+            url += f"&partition={quote(self._partition)}"
         resp = self._request_with_retry("POST", url, content=text.encode("utf-8"))
         self._raise_for_status(resp)
         body = resp.json()
-        return DocumentRecord(
-            doc_id=body["doc_id"],
-            cid=body["cid"],
-            title=body.get("title"),
-            content_type=body.get("content_type", ""),
-            size_bytes=body.get("size_bytes", 0),
-            chunks=body["chunks"],
-            vectors=body["vectors"],
-            version=body["version"],
-            created_at=body.get("created_at"),
-            updated_at=body.get("updated_at"),
-            entity_id=body.get("entity_id"),
-        )
+        return self._parse_document_record(body)
 
     def insert_stream(
         self,
@@ -271,6 +519,8 @@ class AetherClient:
         chunk_size: int | None = None,
         overlap: int | None = None,
         entity_id: str | None = None,
+        source: str | None = None,
+        metadata: Metadata | None = None,
     ) -> DocumentRecord:
         """Insert a document from a file-like object or iterator without loading everything into memory.
 
@@ -279,6 +529,9 @@ class AetherClient:
 
         Pass *entity_id* to associate the document with an entity (e.g. a
         user or customer id) for later filtering on search and list.
+
+        Pass *source* to tag the document with its origin (e.g. a system or
+        channel name) for later filtering on search and list.
 
         Note: streaming uploads bypass the retry wrapper because the stream
         may not be re-readable. Ensure the stream is seekable if you need retries.
@@ -296,24 +549,20 @@ class AetherClient:
             url += f"&overlap={overlap}"
         if entity_id:
             url += f"&entity_id={quote(entity_id)}"
+        if source:
+            url += f"&source={quote(source)}"
+        if metadata is not None:
+            url += f"&metadata={quote(_json_query_value(metadata))}"
+        if self._partition:
+            url += f"&partition={quote(self._partition)}"
         resp = self._client.post(
-            url, content=stream, headers={"Idempotency-Key": new_idempotency_key()}
+            _versioned_path(url),
+            content=stream,
+            headers={"Idempotency-Key": new_idempotency_key()},
         )
         self._raise_for_status(resp)
         body = resp.json()
-        return DocumentRecord(
-            doc_id=body["doc_id"],
-            cid=body["cid"],
-            title=body.get("title"),
-            content_type=body.get("content_type", ""),
-            size_bytes=body.get("size_bytes", 0),
-            chunks=body["chunks"],
-            vectors=body["vectors"],
-            version=body["version"],
-            created_at=body.get("created_at"),
-            updated_at=body.get("updated_at"),
-            entity_id=body.get("entity_id"),
-        )
+        return self._parse_document_record(body)
 
     def update(
         self,
@@ -324,11 +573,14 @@ class AetherClient:
         chunk_size: int | None = None,
         overlap: int | None = None,
         entity_id: str | None = None,
+        source: str | None = None,
+        metadata: Metadata | None = None,
     ) -> DocumentRecord:
         """Update an existing document.
 
         *entity_id* replaces the stored entity id; omitting it clears any
-        existing value (mirrors *tags* semantics).
+        existing value (mirrors *tags* semantics). *source* behaves the same
+        way — it replaces the stored origin, and omitting it clears it.
         """
         if not doc_id:
             raise ValueError("doc_id cannot be empty")
@@ -349,23 +601,17 @@ class AetherClient:
             url += f"&overlap={overlap}"
         if entity_id:
             url += f"&entity_id={quote(entity_id)}"
+        if source:
+            url += f"&source={quote(source)}"
+        if metadata is not None:
+            url += f"&metadata={quote(_json_query_value(metadata))}"
+        if self._partition:
+            url += f"&partition={quote(self._partition)}"
 
         resp = self._request_with_retry("PUT", url, content=data)
         self._raise_for_status(resp)
         body = resp.json()
-        return DocumentRecord(
-            doc_id=body["doc_id"],
-            cid=body["cid"],
-            title=body.get("title"),
-            content_type=body.get("content_type", ""),
-            size_bytes=body.get("size_bytes", 0),
-            chunks=body["chunks"],
-            vectors=body["vectors"],
-            version=body["version"],
-            created_at=body.get("created_at"),
-            updated_at=body.get("updated_at"),
-            entity_id=body.get("entity_id"),
-        )
+        return self._parse_document_record(body)
 
     def get(self, doc_id: str) -> DocumentRecord:
         """Get document metadata."""
@@ -374,19 +620,7 @@ class AetherClient:
         resp = self._request_with_retry("GET",f"/documents/{quote(doc_id)}")
         self._raise_for_status(resp)
         body = resp.json()
-        return DocumentRecord(
-            doc_id=body["doc_id"],
-            cid=body["cid"],
-            title=body.get("title"),
-            content_type=body.get("content_type", ""),
-            size_bytes=body.get("size_bytes", 0),
-            chunks=body.get("chunks", 0),
-            vectors=body.get("vectors", 0),
-            version=body.get("version", 1),
-            created_at=body.get("created_at"),
-            updated_at=body.get("updated_at"),
-            entity_id=body.get("entity_id"),
-        )
+        return self._parse_document_record(body)
 
     def download(self, doc_id: str, output_path: str | Path) -> int:
         """Download a document to a file. Returns bytes written."""
@@ -416,28 +650,25 @@ class AetherClient:
         until: str | None = None,
         last_n_days: int | None = None,
         max_distance: float | None = None,
+        any_tags: list[str] | None = None,
+        content_types: list[str] | None = None,
+        sources: list[str] | None = None,
+        filter: MetadataFilter | None = None,
+        recency_weight: float | None = None,
+        half_life_days: float | None = None,
+        freshness_weight: float | None = None,
+        freshness_half_life_days: float | None = None,
     ) -> list[RetrievalResult]:
-        """Search and return results with full document content included.
+        """Search and return results with document content included.
 
         Combines search() + download_text() into a single call for RAG workflows.
-        Results are deduplicated by doc_id (closest match wins). Since search no
-        longer returns full document content, each unique document's text is
-        fetched by id and attached as ``content``.
+        Results are deduplicated by doc_id (best score wins).
+        Uses server-side include_content when available, falling back to per-doc downloads.
 
-        Args:
-            query: Search query.
-            k: Maximum number of results to return.
-            tags: Optional tag filter; results must carry all listed tags.
-            entity_id: Only match documents associated with this entity id.
-            since: Only match documents created at or after this RFC 3339
-                timestamp (e.g. ``2026-06-01T00:00:00Z``). Inclusive.
-            until: Only match documents created at or before this RFC 3339
-                timestamp. Inclusive.
-            last_n_days: Only match documents created in the last N days.
-                Cannot be combined with ``since``.
-            max_distance: Optional relevance-distance ceiling. Results with
-                ``distance > max_distance`` are dropped server-side. Omit (or pass ``None``) to return the top-k regardless
-                of distance — the historical behavior.
+        The *entity_id*, *since*, *until*, *last_n_days*, *max_distance*,
+        *any_tags*, *content_types*, *sources*, *recency_weight*,
+        *half_life_days*, *freshness_weight* and *freshness_half_life_days*
+        filters are forwarded to search() — see there for semantics.
         """
         if not query:
             raise ValueError("query cannot be empty")
@@ -446,25 +677,33 @@ class AetherClient:
         results = self.search(
             query,
             k=k,
+            include_content=True,
             tags=tags,
             entity_id=entity_id,
             since=since,
             until=until,
             last_n_days=last_n_days,
             max_distance=max_distance,
+            any_tags=any_tags,
+            content_types=content_types,
+            sources=sources,
+            filter=filter,
+            recency_weight=recency_weight,
+            half_life_days=half_life_days,
+            freshness_weight=freshness_weight,
+            freshness_half_life_days=freshness_half_life_days,
         )
 
-        # Deduplicate by doc_id, keeping the closest match
+        # Deduplicate by doc_id, keeping the best match (results arrive in
+        # descending-score order, so the first occurrence wins)
         seen: dict[str, SearchResult] = {}
         for r in results:
             if r.doc_id not in seen:
                 seen[r.doc_id] = r
 
-        # Search returns only the matched passage now (never full document
-        # content), so fetch each unique document's text by id for RAG prompts.
         retrieval_results = []
         for r in seen.values():
-            content = self.download_text(r.doc_id)
+            content = r.content if r.content is not None else self.download_text(r.doc_id)
             retrieval_results.append(
                 RetrievalResult(
                     doc_id=r.doc_id,
@@ -473,6 +712,12 @@ class AetherClient:
                     title=r.title,
                     content_type=r.content_type,
                     passage=r.passage,
+                    entity_id=r.entity_id,
+                    tags=r.tags,
+                    source=r.source,
+                    metadata=r.metadata,
+                    created_at=r.created_at,
+                    updated_at=r.updated_at,
                 )
             )
         return retrieval_results
@@ -485,6 +730,11 @@ class AetherClient:
         since: str | None = None,
         until: str | None = None,
         last_n_days: int | None = None,
+        tags: list[str] | None = None,
+        any_tags: list[str] | None = None,
+        content_types: list[str] | None = None,
+        sources: list[str] | None = None,
+        filter: MetadataFilter | None = None,
     ) -> DocumentPage:
         """List active documents with pagination.
 
@@ -498,6 +748,12 @@ class AetherClient:
                 timestamp. Inclusive.
             last_n_days: Only return documents created in the last N days.
                 Cannot be combined with ``since``.
+            tags: Only return documents carrying **all** of these tags (AND).
+            any_tags: Only return documents carrying **at least one** of these
+                tags (OR).
+            content_types: Only return documents whose content type is one of
+                these (OR).
+            sources: Only return documents whose source is one of these (OR).
 
         Returns:
             A :class:`DocumentPage` (a ``list`` subclass) of records, with
@@ -512,20 +768,23 @@ class AetherClient:
             params["until"] = until
         if last_n_days is not None:
             params["last_n_days"] = last_n_days
+        if tags:
+            params["tags"] = ",".join(tags)
+        if any_tags:
+            params["any_tags"] = ",".join(any_tags)
+        if content_types:
+            params["content_type"] = ",".join(content_types)
+        if sources:
+            params["source"] = ",".join(sources)
+        if filter is not None:
+            params["filter"] = _json_query_value(filter)
+        if self._partition:
+            params["partition"] = self._partition
         resp = self._request_with_retry("GET","/documents", params=params)
         self._raise_for_status(resp)
         body = resp.json()
         documents = [
-            DocumentRecord(
-                doc_id=d["doc_id"],
-                cid="",
-                title=d.get("title"),
-                content_type=d.get("content_type", ""),
-                size_bytes=d.get("size_bytes", 0),
-                version=d.get("version", 1),
-                created_at=d.get("created_at"),
-                entity_id=d.get("entity_id"),
-            )
+            self._parse_document_record({"cid": "", **d})
             for d in body.get("documents", [])
         ]
         return DocumentPage(
@@ -534,11 +793,23 @@ class AetherClient:
             has_more=body.get("has_more", False),
         )
 
-    def delete(self, doc_id: str) -> None:
-        """Tombstone a document."""
+    def delete(self, doc_id: str, hard: bool = False) -> None:
+        """Delete a document.
+
+        By default this is a soft delete: the document is tombstoned (hidden
+        from list/search) and can be brought back with :meth:`restore`.
+
+        Pass ``hard=True`` for a permanent, **irreversible** delete:
+        the document is purged from the primary store and removed from both the
+        vector and keyword indexes, and its encryption key is shredded. Nothing
+        is recoverable afterwards — this is the right-to-be-forgotten path.
+        """
         if not doc_id:
             raise ValueError("doc_id cannot be empty")
-        resp = self._request_with_retry("DELETE",f"/documents/{quote(doc_id)}")
+        path = f"/documents/{quote(doc_id)}"
+        if hard:
+            path += "?hard=true"
+        resp = self._request_with_retry("DELETE", path)
         self._raise_for_status(resp)
 
     def restore(self, doc_id: str) -> None:
@@ -587,23 +858,25 @@ class AetherClient:
         self,
         query: str,
         k: int = 10,
+        include_content: bool = False,
         tags: list[str] | None = None,
         entity_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
         last_n_days: int | None = None,
         max_distance: float | None = None,
+        any_tags: list[str] | None = None,
+        content_types: list[str] | None = None,
+        sources: list[str] | None = None,
+        filter: MetadataFilter | None = None,
+        recency_weight: float | None = None,
+        half_life_days: float | None = None,
+        freshness_weight: float | None = None,
+        freshness_half_life_days: float | None = None,
     ) -> list[SearchResult]:
         """Similarity search across documents.
 
-        Each hit carries the matched ``passage`` (by default) and a calibrated
-        ``score`` (0-100, higher = better). Full document text is never inlined;
-        use :py:meth:`retrieve` or :py:meth:`download_text` to fetch it.
-
         Args:
-            query: Search query.
-            k: Maximum number of results to return.
-            tags: Optional tag filter; results must carry all listed tags.
             entity_id: Only match documents associated with this entity id.
             since: Only match documents created at or after this RFC 3339
                 timestamp (e.g. ``2026-06-01T00:00:00Z``). Inclusive.
@@ -611,15 +884,36 @@ class AetherClient:
                 timestamp. Inclusive.
             last_n_days: Only match documents created in the last N days.
                 Cannot be combined with ``since``.
-            max_distance: Optional relevance-distance ceiling. Results with
-                ``distance > max_distance`` are dropped server-side. Omit (or pass ``None``) to return the top-k regardless
-                of distance — the historical behavior.
+            max_distance: Drop results whose distance exceeds this threshold.
+            tags: Only match documents carrying **all** of these tags (AND).
+            any_tags: Only match documents carrying **at least one** of these
+                tags (OR).
+            content_types: Only match documents whose content type is one of
+                these (OR).
+            sources: Only match documents whose source is one of these (OR).
+            recency_weight: Blend recency into ranking, ``0.0``–``1.0``
+               . ``0`` (default) is pure similarity; ``1`` is pure
+                recency. ``final = (1-w)*similarity + w*recency`` where
+                ``recency = exp(-age_days / half_life_days)``.
+            half_life_days: Age (in days) at which the recency contribution
+                halves. Defaults server-side to 30; only consulted when
+                ``recency_weight > 0``. Must be > 0.
+            freshness_weight: Blend freshness into ranking, ``0.0``–``1.0``.
+                Boosts recently *updated* documents (``updated_at``, falling
+                back to ``created_at``). Composes with ``recency_weight``;
+                the server rejects ``recency_weight + freshness_weight > 1``.
+                May require a Scale plan or higher.
+            freshness_half_life_days: Age (in days) at which the freshness
+                contribution halves. Defaults server-side to 14; only
+                consulted when ``freshness_weight > 0``. Must be > 0.
         """
         if not query:
             raise ValueError("query cannot be empty")
         if k < 1:
             raise ValueError("k must be at least 1")
         params: dict = {"q": query, "k": k}
+        if include_content:
+            params["include_content"] = "true"
         if tags:
             params["tags"] = ",".join(tags)
         if entity_id:
@@ -632,20 +926,212 @@ class AetherClient:
             params["last_n_days"] = last_n_days
         if max_distance is not None:
             params["max_distance"] = max_distance
+        if any_tags:
+            params["any_tags"] = ",".join(any_tags)
+        if content_types:
+            params["content_type"] = ",".join(content_types)
+        if sources:
+            params["source"] = ",".join(sources)
+        if filter is not None:
+            params["filter"] = _json_query_value(filter)
+        if recency_weight is not None:
+            params["recency_weight"] = recency_weight
+        if half_life_days is not None:
+            params["half_life_days"] = half_life_days
+        if freshness_weight is not None:
+            params["freshness_weight"] = freshness_weight
+        if freshness_half_life_days is not None:
+            params["freshness_half_life_days"] = freshness_half_life_days
+        if self._partition:
+            params["partition"] = self._partition
         resp = self._request_with_retry("GET","/search", params=params)
         self._raise_for_status(resp)
         body = resp.json()
-        return [
-            SearchResult(
-                doc_id=r["doc_id"],
-                score=r["score"],
-                title=r.get("title"),
-                content_type=r.get("content_type", ""),
-                passage=r.get("passage"),
-                entity_id=r.get("entity_id"),
+        query_id = body.get("query_id")
+        return [self._parse_search_result(r, query_id) for r in body.get("results", [])]
+
+    @staticmethod
+    def _parse_search_result(r: dict, query_id: Optional[str] = None) -> SearchResult:
+        """Map a search-hit JSON object to a :class:`SearchResult`.
+
+        *query_id* is the response-level feedback handle (present only when
+        usage-feedback capture is enabled for the tenant); it is stamped onto
+        every hit so a caller can pass it straight to
+        :meth:`send_search_feedback`. Absent -> ``None``, like the other
+        optional fields.
+        """
+        return SearchResult(
+            doc_id=r["doc_id"],
+            score=r["score"],
+            title=r.get("title"),
+            content_type=r.get("content_type", ""),
+            content=r.get("content"),
+            passage=r.get("passage"),
+            entity_id=r.get("entity_id"),
+            tags=list(r.get("tags") or []),
+            source=r.get("source"),
+            metadata=dict(r.get("metadata") or {}),
+            created_at=r.get("created_at"),
+            updated_at=r.get("updated_at"),
+            query_id=query_id,
+        )
+
+    def send_search_feedback(self, query_id: str, doc_id: str, signal: str) -> None:
+        """Report how a search result was actually used.
+
+        Ties a returned hit back to its real outcome so retrieval quality can
+        be measured against actual usage. *signal* is one of ``"used"``,
+        ``"cited"`` or ``"ignored"``.
+
+        Requires usage-feedback capture to be enabled for your tenant; search
+        results then carry a ``query_id`` to pass here (``None`` otherwise).
+        The server rejects an unknown ``query_id`` with 404 and an invalid
+        *signal* with 400 (both surface as :class:`AetherApiError`).
+        """
+        if not query_id:
+            raise ValueError("query_id cannot be empty")
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        if not signal:
+            raise ValueError("signal cannot be empty")
+        body = {"query_id": query_id, "doc_id": doc_id, "signal": signal}
+        resp = self._request_with_retry("POST", "/search/feedback", json=body)
+        self._raise_for_status(resp)
+
+    @staticmethod
+    def _parse_trace(t: dict) -> SearchTrace:
+        return SearchTrace(
+            scoped_to=t.get("scoped_to"),
+            partitions_touched=t.get("partitions_touched", []),
+            default_partition_touched=t.get("default_partition_touched", False),
+            results=t.get("results", 0),
+            candidates_in_scope=t.get("candidates_in_scope"),
+            boundary=t.get("boundary", ""),
+        )
+
+    def search_trace(
+        self,
+        query: str,
+        k: int = 10,
+        include_content: bool = False,
+        tags: list[str] | None = None,
+        entity_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        last_n_days: int | None = None,
+        max_distance: float | None = None,
+        filter: MetadataFilter | None = None,
+    ) -> TracedSearch:
+        """Like :meth:`search`, but also return an isolation :class:`SearchTrace`.
+
+        The trace is computed from the records actually returned, so it is
+        evidence — not intent — of which partition(s) the query touched. Under a
+        partition handle the scope is injected exactly as in :meth:`search`; the
+        trace then proves the boundary held (``partitions_touched`` is ``[]`` or
+        ``[scoped_to]``, and ``candidates_in_scope`` is the partition's own size).
+        """
+        if not query:
+            raise ValueError("query cannot be empty")
+        if k < 1:
+            raise ValueError("k must be at least 1")
+        params: dict = {"q": query, "k": k, "trace": "true"}
+        if include_content:
+            params["include_content"] = "true"
+        if tags:
+            params["tags"] = ",".join(tags)
+        if entity_id:
+            params["entity_id"] = entity_id
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
+        if last_n_days is not None:
+            params["last_n_days"] = last_n_days
+        if max_distance is not None:
+            params["max_distance"] = max_distance
+        if filter is not None:
+            params["filter"] = _json_query_value(filter)
+        if self._partition:
+            params["partition"] = self._partition
+        resp = self._request_with_retry("GET", "/search", params=params)
+        self._raise_for_status(resp)
+        body = resp.json()
+        query_id = body.get("query_id")
+        results = [self._parse_search_result(r, query_id) for r in body.get("results", [])]
+        return TracedSearch(results=results, trace=self._parse_trace(body.get("trace", {})))
+
+    def verify_isolation(
+        self,
+        query: str,
+        k: int = 10,
+    ) -> IsolationCheck:
+        """Self-test that a scoped search never leaks out of this partition.
+
+        Runs :meth:`search_trace` under this handle's partition and checks that
+        every returned record stayed in scope. ``ok`` is true iff nothing
+        leaked. Only meaningful on a partition handle and for a query that
+        returns results — a 0-result query passes vacuously.
+
+        Drop one line into your own tests to prove isolation against your data::
+
+            assert client.partition("client_42").verify_isolation("returns policy").ok
+        """
+        if self._partition is None:
+            raise ValueError(
+                "verify_isolation requires a partition handle — call "
+                "client.partition(id).verify_isolation(...)"
             )
-            for r in body.get("results", [])
-        ]
+        traced = self.search_trace(query, k=k)
+        scoped = self._partition
+        leaked = [p for p in traced.trace.partitions_touched if p != scoped]
+        ok = not leaked and not traced.trace.default_partition_touched
+        return IsolationCheck(
+            ok=ok,
+            scoped_to=scoped,
+            partitions_touched=traced.trace.partitions_touched,
+            results=traced.trace.results,
+            candidates_in_scope=traced.trace.candidates_in_scope,
+            leaked=leaked,
+        )
+
+    # ── Partitions ──────────────────────────────────────────────────
+
+    def list_partitions(self) -> PartitionList:
+        """List this tenant's partitions with active document counts.
+
+        Tenant-level (does **not** use the partition handle). Includes advisory
+        ``warnings`` flagging likely typos / ghost partitions; the default
+        (unkeyed) partition is not listed.
+        """
+        resp = self._request_with_retry("GET", "/partitions")
+        self._raise_for_status(resp)
+        body = resp.json()
+        return PartitionList(
+            partitions=[
+                PartitionInfo(id=p["id"], document_count=p.get("document_count", 0))
+                for p in body.get("partitions", [])
+            ],
+            warnings=[
+                PartitionWarning(
+                    kind=w["kind"],
+                    partitions=w.get("partitions", []),
+                    detail=w.get("detail", ""),
+                )
+                for w in body.get("warnings", [])
+            ],
+        )
+
+    def delete_partition(self, partition_id: str) -> int:
+        """Delete a partition and shred **every** document in it (active and
+        tombstoned). One-call GDPR / client-offboarding teardown.
+
+        Returns the number of documents deleted. Idempotent: deleting an
+        unknown or empty partition returns ``0`` and is never an error.
+        """
+        partition_id = _validate_partition(partition_id)
+        resp = self._request_with_retry("DELETE", f"/partitions/{quote(partition_id, safe='')}")
+        self._raise_for_status(resp)
+        return resp.json().get("documents_deleted", 0)
 
     # ── BYOE (Bring Your Own Embeddings) ────────────────────────────
 
@@ -658,6 +1144,8 @@ class AetherClient:
         content_type: str = "text/plain",
         tags: list[str] | None = None,
         entity_id: str | None = None,
+        source: str | None = None,
+        metadata: Metadata | None = None,
     ) -> DocumentRecord:
         """Insert a document with caller-provided embeddings.
 
@@ -666,6 +1154,9 @@ class AetherClient:
 
         Pass *entity_id* to associate the document with an entity (e.g. a
         user or customer id) for later filtering on search and list.
+
+        Pass *source* to tag the document with its origin (e.g. a system or
+        channel name) for later filtering on search and list.
         """
         if not content:
             raise ValueError("content cannot be empty")
@@ -681,41 +1172,69 @@ class AetherClient:
             body["tags"] = tags
         if entity_id:
             body["entity_id"] = entity_id
+        if source:
+            body["source"] = source
+        if metadata is not None:
+            body["metadata"] = metadata
+        if self._partition:
+            body["partition"] = self._partition
 
         resp = self._request_with_retry("POST","/documents/embed", json=body)
         self._raise_for_status(resp)
         r = resp.json()
-        return DocumentRecord(
-            doc_id=r["doc_id"], cid=r["cid"],
-            title=r.get("title"), content_type=r.get("content_type", ""),
-            size_bytes=r.get("size_bytes", 0),
-            chunks=r["chunks"], vectors=r["vectors"], version=r["version"],
-            created_at=r.get("created_at"), updated_at=r.get("updated_at"),
-            entity_id=r.get("entity_id"),
-        )
+        return self._parse_document_record(r)
 
     def search_by_vector(
         self,
         embedding: list[float],
         k: int = 10,
+        include_content: bool = False,
         tags: list[str] | None = None,
         entity_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
         last_n_days: int | None = None,
         max_distance: float | None = None,
+        any_tags: list[str] | None = None,
+        content_types: list[str] | None = None,
+        sources: list[str] | None = None,
+        filter: MetadataFilter | None = None,
+        recency_weight: float | None = None,
+        half_life_days: float | None = None,
+        freshness_weight: float | None = None,
+        freshness_half_life_days: float | None = None,
     ) -> list[SearchResult]:
         """Search using a pre-computed query embedding.
 
-        See :py:meth:`search` for the result shape and the semantics of the
-        ``entity_id``, ``since``, ``until``, ``last_n_days`` and ``max_distance``
-        filters.
+        Args:
+            entity_id: Only match documents associated with this entity id.
+            since: Only match documents created at or after this RFC 3339
+                timestamp (e.g. ``2026-06-01T00:00:00Z``). Inclusive.
+            until: Only match documents created at or before this RFC 3339
+                timestamp. Inclusive.
+            last_n_days: Only match documents created in the last N days.
+                Cannot be combined with ``since``.
+            max_distance: Drop results whose distance exceeds this threshold.
+            tags: Only match documents carrying **all** of these tags (AND).
+            any_tags: Only match documents carrying **at least one** of these
+                tags (OR).
+            content_types: Only match documents whose content type is one of
+                these (OR).
+            sources: Only match documents whose source is one of these (OR).
+            recency_weight: Blend recency into ranking, ``0.0``–``1.0``
+                See :meth:`search`.
+            half_life_days: Recency half-life in days; see :meth:`search`.
+            freshness_weight: Blend freshness (recent updates) into ranking,
+                ``0.0``–``1.0``; server default half-life is 14 days. See
+                :meth:`search`. May require a Scale plan or higher.
+            freshness_half_life_days: Freshness half-life in days; see
+                :meth:`search`.
         """
         if not embedding:
             raise ValueError("embedding cannot be empty")
         if k < 1:
             raise ValueError("k must be at least 1")
-        body: dict = {"embedding": embedding, "k": k}
+        body: dict = {"embedding": embedding, "k": k, "include_content": include_content}
         if tags:
             body["tags"] = tags
         if entity_id:
@@ -728,18 +1247,29 @@ class AetherClient:
             body["last_n_days"] = last_n_days
         if max_distance is not None:
             body["max_distance"] = max_distance
+        if any_tags:
+            body["any_tags"] = any_tags
+        if content_types:
+            body["content_type"] = content_types
+        if sources:
+            body["source"] = sources
+        if filter is not None:
+            body["filter"] = filter
+        if recency_weight is not None:
+            body["recency_weight"] = recency_weight
+        if half_life_days is not None:
+            body["half_life_days"] = half_life_days
+        if freshness_weight is not None:
+            body["freshness_weight"] = freshness_weight
+        if freshness_half_life_days is not None:
+            body["freshness_half_life_days"] = freshness_half_life_days
+        if self._partition:
+            body["partition"] = self._partition
         resp = self._request_with_retry("POST","/search/embed", json=body)
         self._raise_for_status(resp)
         r = resp.json()
-        return [
-            SearchResult(
-                doc_id=sr["doc_id"], score=sr["score"],
-                title=sr.get("title"), content_type=sr.get("content_type", ""),
-                passage=sr.get("passage"),
-                entity_id=sr.get("entity_id"),
-            )
-            for sr in r.get("results", [])
-        ]
+        query_id = r.get("query_id")
+        return [self._parse_search_result(sr, query_id) for sr in r.get("results", [])]
 
     # ── Async Processing ──────────────────────────────────────────────
     
@@ -751,12 +1281,17 @@ class AetherClient:
         chunk_size: int | None = None,
         overlap: int | None = None,
         entity_id: str | None = None,
+        source: str | None = None,
+        metadata: Metadata | None = None,
     ) -> dict:
         """Enqueue a document for asynchronous processing.
         Returns a dict with: job_id, status, poll_url.
 
         Pass *entity_id* to associate the document with an entity (e.g. a
         user or customer id) for later filtering on search and list.
+
+        Pass *source* to tag the document with its origin (e.g. a system or
+        channel name) for later filtering on search and list.
         """
         path = Path(file_path)
         data = path.read_bytes()
@@ -773,6 +1308,12 @@ class AetherClient:
             url += f"&overlap={overlap}"
         if entity_id:
             url += f"&entity_id={quote(entity_id)}"
+        if source:
+            url += f"&source={quote(source)}"
+        if metadata is not None:
+            url += f"&metadata={quote(_json_query_value(metadata))}"
+        if self._partition:
+            url += f"&partition={quote(self._partition)}"
 
         resp = self._request_with_retry("POST", url, content=data)
         self._raise_for_status(resp)
@@ -811,6 +1352,9 @@ class AetherClient:
                     "content": d.content,
                     **({"tags": ",".join(d.tags)} if d.tags else {}),
                     **({"entity_id": d.entity_id} if d.entity_id else {}),
+                    **({"source": d.source} if d.source else {}),
+                    **({"metadata": d.metadata} if d.metadata is not None else {}),
+                    **({"partition": self._partition} if self._partition else {}),
                 }
                 for d in documents
             ],
@@ -824,19 +1368,7 @@ class AetherClient:
         self._raise_for_status(resp)
         body = resp.json()
         return [
-            DocumentRecord(
-                doc_id=r["doc_id"],
-                cid=r["cid"],
-                title=r.get("title"),
-                content_type=r.get("content_type", ""),
-                size_bytes=r.get("size_bytes", 0),
-                chunks=r["chunks"],
-                vectors=r["vectors"],
-                version=r["version"],
-                created_at=r.get("created_at"),
-                updated_at=r.get("updated_at"),
-                entity_id=r.get("entity_id"),
-            )
+            self._parse_document_record(r)
             for r in body.get("results", [])
         ]
 
@@ -853,11 +1385,21 @@ class AetherClient:
                     "q": q.q,
                     "k": q.k,
                     **({"tags": ",".join(q.tags)} if q.tags else {}),
+                    **({"include_content": q.include_content} if q.include_content else {}),
                     **({"entity_id": q.entity_id} if q.entity_id else {}),
                     **({"since": q.since} if q.since else {}),
                     **({"until": q.until} if q.until else {}),
                     **({"last_n_days": q.last_n_days} if q.last_n_days is not None else {}),
                     **({"max_distance": q.max_distance} if q.max_distance is not None else {}),
+                    **({"any_tags": ",".join(q.any_tags)} if q.any_tags else {}),
+                    **({"content_type": ",".join(q.content_types)} if q.content_types else {}),
+                    **({"source": ",".join(q.sources)} if q.sources else {}),
+                    **({"filter": q.filter} if q.filter is not None else {}),
+                    **({"recency_weight": q.recency_weight} if q.recency_weight is not None else {}),
+                    **({"half_life_days": q.half_life_days} if q.half_life_days is not None else {}),
+                    **({"freshness_weight": q.freshness_weight} if q.freshness_weight is not None else {}),
+                    **({"freshness_half_life_days": q.freshness_half_life_days} if q.freshness_half_life_days is not None else {}),
+                    **({"partition": self._partition} if self._partition else {}),
                 }
                 for q in queries
             ],
@@ -869,14 +1411,7 @@ class AetherClient:
             BatchSearchResponse(
                 query=r["query"],
                 results=[
-                    SearchResult(
-                        doc_id=sr["doc_id"],
-                        score=sr["score"],
-                        title=sr.get("title"),
-                        content_type=sr.get("content_type", ""),
-                        passage=sr.get("passage"),
-                        entity_id=sr.get("entity_id"),
-                    )
+                    self._parse_search_result(sr, r.get("query_id"))
                     for sr in r.get("results", [])
                 ],
             )
