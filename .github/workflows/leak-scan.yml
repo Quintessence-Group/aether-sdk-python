@@ -1,5 +1,10 @@
 name: leak-scan
 on: [push, pull_request]
+# Least-privilege GITHUB_TOKEN: this workflow only needs to read repo
+# contents (checkout). Deploy/publish steps use their own scoped secrets.
+permissions:
+  contents: read
+
 jobs:
   scan:
     runs-on: ubuntu-latest
