@@ -845,23 +845,51 @@ async def test_async_partition_value_is_url_encoded(client):
 
 
 @pytest.mark.asyncio
-async def test_async_get_sends_no_partition(client):
+async def test_async_get_sends_partition_guard(client):
     resp = make_async_response(json_data={"doc_id": "d1", "cid": "c1"})
     with patch.object(client._client, "request", new_callable=AsyncMock, return_value=resp) as mock_req:
         await client.partition("tenant-a").get("d1")
 
-    assert "partition" not in mock_req.call_args[0][1]
-    assert "params" not in mock_req.call_args[1]
+    assert mock_req.call_args[0][1] == "/v1/documents/d1?partition=tenant-a"
 
 
 @pytest.mark.asyncio
-async def test_async_delete_sends_no_partition(client):
+async def test_async_delete_sends_partition_guard(client):
     resp = make_async_response()
     with patch.object(client._client, "request", new_callable=AsyncMock, return_value=resp) as mock_req:
         await client.partition("tenant-a").delete("d1")
 
-    assert "partition" not in mock_req.call_args[0][1]
+    assert mock_req.call_args[0][1] == "/v1/documents/d1?partition=tenant-a"
+
+
+@pytest.mark.asyncio
+async def test_async_unscoped_get_sends_no_partition(client):
+    # The base client keeps the pre-handle wire shape byte-identical.
+    resp = make_async_response(json_data={"doc_id": "d1", "cid": "c1"})
+    with patch.object(client._client, "request", new_callable=AsyncMock, return_value=resp) as mock_req:
+        await client.get("d1")
+
+    assert mock_req.call_args[0][1] == "/v1/documents/d1"
     assert "params" not in mock_req.call_args[1]
+
+
+@pytest.mark.asyncio
+async def test_async_move_document_sends_both_body_fields(client):
+    resp = make_async_response(
+        json_data={"doc_id": "d1", "cid": "c1", "version": 2, "partition": "tenant-b"},
+    )
+    with patch.object(client._client, "request", new_callable=AsyncMock, return_value=resp) as mock_req:
+        record = await client.move_document("d1", from_partition=None, to_partition="tenant-b")
+
+    method, url = mock_req.call_args[0]
+    assert method == "POST"
+    assert url == "/v1/documents/d1/move"
+    # Both keys are always present; explicit null = the default partition.
+    assert mock_req.call_args[1]["json"] == {
+        "to_partition": "tenant-b",
+        "expect_partition": None,
+    }
+    assert record.partition == "tenant-b"
 
 
 @pytest.mark.asyncio

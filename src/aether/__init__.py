@@ -24,12 +24,17 @@ from .errors import (
     aether_api_error_from_response,
 )
 from .models import (
+    AggregateResult,
+    AuditProof,
+    AuditRecord,
     BatchInsertItem,
     BatchSearchQuery,
     BatchSearchResponse,
     DocumentPage,
     DocumentRecord,
     EntityBackfillReport,
+    FieldSchema,
+    QueryGroup,
     IngestResult,
     IsolationCheck,
     Metadata,
@@ -44,6 +49,7 @@ from .models import (
     SearchTrace,
     TracedSearch,
 )
+from .schema import AsyncSchemaClient, SchemaClient
 from .rag import format_context
 
 __all__ = [
@@ -58,6 +64,8 @@ __all__ = [
     "PartitionRequiredError",
     "TenantPausedError",
     "aether_api_error_from_response",
+    "AuditProof",
+    "AuditRecord",
     "BatchInsertItem",
     "BatchSearchQuery",
     "BatchSearchResponse",
@@ -77,6 +85,11 @@ __all__ = [
     "Metadata",
     "MetadataFilter",
     "MetadataValue",
+    "AggregateResult",
+    "QueryGroup",
+    "FieldSchema",
+    "SchemaClient",
+    "AsyncSchemaClient",
     "Memory",
     "AsyncMemory",
     "MemoryItem",

@@ -8,6 +8,8 @@ import pytest
 
 from aether import (
     AetherClient,
+    AuditProof,
+    AuditRecord,
     DocumentRecord,
     EntityBackfillReport,
     IngestResult,
@@ -499,6 +501,89 @@ class TestSearchResultMetadataParsing:
 
         assert records[0].tags == ["a", "b"]
         assert records[0].source == "email"
+
+
+class TestLineage:
+    _PAYLOAD = {
+        "doc_id": "11111111-1111-1111-1111-111111111111",
+        "records": [
+            {
+                "at": "2026-07-05T12:00:00+00:00",
+                "actor": "node:abcd",
+                "action": "document.inserted",
+                "resource": "document:11111111-1111-1111-1111-111111111111",
+                "outcome": "committed",
+                "source": "ledger",
+                "proof": {
+                    "content_id": "blake3:deadbeef",
+                    "lamport": 42,
+                    "node_id": "a" * 64,
+                    "public_key": "pubkeyhex",
+                    "signature": "sighex",
+                    "verified": True,
+                },
+            },
+            {
+                "at": "2026-07-05T13:00:00+00:00",
+                "actor": "node:abcd",
+                "action": "document.deleted",
+                "resource": "document:11111111-1111-1111-1111-111111111111",
+                "outcome": "committed",
+                "source": "ledger",
+                # tombstone: proof present but WITHOUT a content_id key
+                "proof": {
+                    "lamport": 43,
+                    "node_id": "a" * 64,
+                    "public_key": "pubkeyhex",
+                    "signature": "sighex2",
+                    "verified": True,
+                },
+            },
+        ],
+    }
+
+    def test_parses_both_records_and_proofs(self, client):
+        resp = _ok_response()
+        resp.json.return_value = self._PAYLOAD
+        with patch.object(client._client, "request", return_value=resp):
+            records = client.lineage("11111111-1111-1111-1111-111111111111")
+
+        assert len(records) == 2
+        assert all(isinstance(r, AuditRecord) for r in records)
+
+        insert, tombstone = records
+        assert insert.action == "document.inserted"
+        assert insert.outcome == "committed"
+        assert insert.source == "ledger"
+        assert isinstance(insert.proof, AuditProof)
+        assert insert.proof.content_id == "blake3:deadbeef"
+        assert insert.proof.lamport == 42
+        assert insert.proof.node_id == "a" * 64
+        assert insert.proof.public_key == "pubkeyhex"
+        assert insert.proof.signature == "sighex"
+        assert insert.proof.verified is True
+
+        # Tombstone still has a proof, but its content_id key was absent.
+        assert tombstone.action == "document.deleted"
+        assert isinstance(tombstone.proof, AuditProof)
+        assert tombstone.proof.content_id is None
+        assert tombstone.proof.lamport == 43
+        assert tombstone.proof.verified is True
+
+    def test_calls_unversioned_audit_path(self, client):
+        resp = _ok_response()
+        resp.json.return_value = {"doc_id": "d1", "records": []}
+        with patch.object(client._client, "request", return_value=resp) as mock_req:
+            client.lineage("d1")
+
+        # Mirror get(): the client prefixes /v1 and the method uses the
+        # unversioned /audit/records/{doc_id} path.
+        _, called_url = mock_req.call_args.args[:2]
+        assert called_url == "/v1/audit/records/d1"
+
+    def test_empty_doc_id_raises(self, client):
+        with pytest.raises(ValueError):
+            client.lineage("")
 
 
 class TestInsertEntityId:
@@ -1050,25 +1135,34 @@ class TestPartitionHandle:
         # Same encoding entity_id receives on query routes.
         assert "partition=tenant%3Aa" in _wire_url(mock_req.call_args[1]["params"])
 
-    # ── doc_id-addressed methods carry no partition ───────────────────
+    # ── doc_id-addressed methods carry the partition guard ────────────
 
-    def test_get_sends_no_partition(self, client):
+    def test_get_sends_partition_guard(self, client):
         resp = _ok_response()
         resp.json.return_value = {"doc_id": "d1", "cid": "c1"}
         with patch.object(client._client, "request", return_value=resp) as mock_req:
             client.partition("tenant-a").get("d1")
 
         method, url = mock_req.call_args[0]
-        assert "partition" not in url
-        assert "params" not in mock_req.call_args[1]
+        assert url == "/v1/documents/d1?partition=tenant-a"
 
-    def test_delete_sends_no_partition(self, client):
+    def test_delete_sends_partition_guard(self, client):
         resp = _ok_response()
         with patch.object(client._client, "request", return_value=resp) as mock_req:
             client.partition("tenant-a").delete("d1")
 
         method, url = mock_req.call_args[0]
-        assert "partition" not in url
+        assert url == "/v1/documents/d1?partition=tenant-a"
+
+    def test_unscoped_get_sends_no_partition(self, client):
+        # The base client keeps the pre-handle wire shape byte-identical.
+        resp = _ok_response()
+        resp.json.return_value = {"doc_id": "d1", "cid": "c1"}
+        with patch.object(client._client, "request", return_value=resp) as mock_req:
+            client.get("d1")
+
+        method, url = mock_req.call_args[0]
+        assert url == "/v1/documents/d1"
         assert "params" not in mock_req.call_args[1]
 
     def test_delete_soft_by_default(self, client):
