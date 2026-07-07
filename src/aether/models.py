@@ -55,7 +55,61 @@ class DocumentRecord:
     entity_id: Optional[str] = None
     tags: list[str] = field(default_factory=list)
     source: Optional[str] = None
+    #: Partition the document lives in, echoed back by the engine on every
+    #: document response. ``None`` means the default partition (mirrors the
+    #: ``entity_id``/``source`` convention).
+    partition: Optional[str] = None
     metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass
+class AuditProof:
+    """Cryptographic proof attached to a ledger audit record.
+
+    Present for ledger-sourced :class:`AuditRecord` entries. ``content_id`` is
+    the blake3 content address of the document at the time of the event; it is
+    omitted (``None``) for events that do not reference content, such as a
+    tombstone/deletion.
+    """
+
+    #: blake3 content address (e.g. ``blake3:...``) of the document at the
+    #: event, or ``None`` when the event references no content (e.g. a delete).
+    content_id: Optional[str] = None
+    #: Lamport clock value of the event, giving a total order across the ledger.
+    lamport: int = 0
+    #: Hex node id of the node that signed the record.
+    node_id: str = ""
+    #: Hex-encoded public key the signature verifies against.
+    public_key: str = ""
+    #: Hex-encoded signature over the record.
+    signature: str = ""
+    #: Whether the SDK/engine verified the signature against ``public_key``.
+    verified: bool = False
+
+
+@dataclass
+class AuditRecord:
+    """One entry in a document's signed provenance/lineage trail.
+
+    Returned by :meth:`AetherClient.lineage`. ``proof`` is always present for
+    ``source == "ledger"`` records but is modelled as optional so records from
+    other sources (or older servers) still parse.
+    """
+
+    #: RFC 3339 timestamp of when the event occurred.
+    at: str
+    #: Who performed the action (e.g. ``node:<hex>``).
+    actor: str
+    #: The action taken (e.g. ``document.inserted``).
+    action: str
+    #: The resource acted upon (e.g. ``document:<uuid>``).
+    resource: str
+    #: The outcome of the action (e.g. ``committed``).
+    outcome: str
+    #: Where this record came from (e.g. ``ledger``).
+    source: str
+    #: Cryptographic proof for the record, or ``None`` when absent.
+    proof: Optional[AuditProof] = None
 
 
 @dataclass
@@ -74,6 +128,10 @@ class SearchResult:
     entity_id: Optional[str] = None
     tags: list[str] = field(default_factory=list)
     source: Optional[str] = None
+    #: Partition the matched document lives in, echoed back by the engine on
+    #: every hit. ``None`` means the default partition (mirrors the
+    #: ``entity_id``/``source`` convention).
+    partition: Optional[str] = None
     metadata: Metadata = field(default_factory=dict)
     #: RFC 3339 timestamp of when the matched document was created.
     created_at: Optional[str] = None
@@ -136,6 +194,9 @@ class RetrievalResult:
     entity_id: Optional[str] = None
     tags: list[str] = field(default_factory=list)
     source: Optional[str] = None
+    #: Partition the matched document lives in; ``None`` means the default
+    #: partition (mirrors the ``entity_id``/``source`` convention).
+    partition: Optional[str] = None
     metadata: Metadata = field(default_factory=dict)
     created_at: Optional[str] = None
     #: RFC 3339 timestamp of the document's last update, or ``None``.
@@ -282,3 +343,50 @@ class IsolationCheck:
     results: int
     candidates_in_scope: Optional[int]
     leaked: list[str]
+
+
+# ── Structured query & field schema ──────────────────────────────────
+
+@dataclass
+class FieldSchema:
+    """A declared typed field for the structured-query layer.
+
+    Field values are extracted from document metadata (or passage text via a
+    regex) at ingest time, and become filterable / sortable / aggregatable
+    through :meth:`AetherClient.query`.
+    """
+    name: str
+    #: One of ``string``, ``int``, ``float``, ``bool``, ``datetime``,
+    #: ``string_list``.
+    type: str
+    #: Where the value comes from: ``{"metadata": "<key>"}`` or
+    #: ``{"regex": "<pattern>"}``.
+    source: dict = field(default_factory=dict)
+    #: Hard-partition scope, or ``None`` for a tenant-wide field.
+    partition_scope: Optional[str] = None
+    #: Active documents whose source value coerced to the declared type.
+    coverage: int = 0
+    #: Active documents whose source value was present but failed to coerce.
+    mismatch_count: int = 0
+    #: Backfill state; ``"complete"`` in v1 (synchronous on declare).
+    backfill: str = "complete"
+
+
+@dataclass
+class QueryGroup:
+    """One group in an aggregation (Mode B) result."""
+    #: Group-key values keyed by ``group_by`` field name; empty for a
+    #: whole-population aggregate.
+    keys: dict
+    #: Computed aggregates keyed by output name (the ``as`` alias or a default).
+    aggregates: dict
+
+
+@dataclass
+class AggregateResult:
+    """Result of an aggregation (Mode B) :meth:`AetherClient.query`."""
+    groups: list["QueryGroup"]
+    #: Distinct group count before ``limit`` is applied.
+    total_groups: int
+    #: Documents folded into the aggregation (post-filter).
+    scanned: int

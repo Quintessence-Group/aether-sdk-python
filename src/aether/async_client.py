@@ -10,20 +10,30 @@ import os
 import random
 import time as _time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import quote
 
 import httpx
 
 from ._internal import USER_AGENT, enforce_secure_base_url, new_idempotency_key
-from .client import _validate_partition, _versioned_path
+from .client import (
+    AetherClient,
+    _validate_partition,
+    _versioned_path,
+    _with_partition_guard,
+)
 from .errors import AetherApiError, AetherNetworkError, aether_api_error_from_response
+from .schema import AsyncSchemaClient
 from .models import (
+    AggregateResult,
+    AuditProof,
+    AuditRecord,
     BatchInsertItem,
     BatchSearchQuery,
     BatchSearchResponse,
     DocumentPage,
     DocumentRecord,
+    QueryGroup,
     EntityBackfillReport,
     IngestResult,
     IsolationCheck,
@@ -98,6 +108,13 @@ class AsyncAetherClient:
         A multi-tenant key requires a partition on every call; an unscoped call
         under such a key is rejected by the server. Under a single-tenant key,
         unscoped calls operate on the default partition.
+
+        ID-addressed calls (``get``, ``download`` / ``download_text``,
+        ``delete``, ``restore``, ``update``) carry the scope as a **guard**: a
+        document outside this partition is indistinguishable from a missing one
+        (the same not-found error), so a bare doc id can never reach another
+        partition's document. ``backfill_entity_from_tags`` likewise constrains
+        its scan to this partition.
 
         The clone shares this client's transport and all configuration (base
         url, auth, timeout, retries, backoff). It does **not** own the transport:
@@ -230,7 +247,8 @@ class AsyncAetherClient:
         """Map a document JSON object to a :class:`DocumentRecord`.
 
         New optional fields default so payloads from older servers (which omit
-        them) still parse: ``tags`` -> ``[]``, ``source`` -> ``None``.
+        them) still parse: ``tags`` -> ``[]``, ``source`` / ``partition`` ->
+        ``None`` (for ``partition``, ``None`` is also the default partition).
         """
         return DocumentRecord(
             doc_id=d["doc_id"],
@@ -246,6 +264,7 @@ class AsyncAetherClient:
             entity_id=d.get("entity_id"),
             tags=list(d.get("tags") or []),
             source=d.get("source"),
+            partition=d.get("partition"),
             metadata=dict(d.get("metadata") or {}),
         )
 
@@ -561,16 +580,36 @@ class AsyncAetherClient:
         """Get document metadata."""
         if not doc_id:
             raise ValueError("doc_id cannot be empty")
-        resp = await self._request_with_retry("GET",f"/documents/{quote(doc_id)}")
+        resp = await self._request_with_retry(
+            "GET", _with_partition_guard(f"/documents/{quote(doc_id)}", self._partition)
+        )
         self._raise_for_status(resp)
         body = resp.json()
         return self._parse_document_record(body)
+
+    async def lineage(self, doc_id: str) -> list[AuditRecord]:
+        """Return the signed provenance/lineage trail for a document.
+
+        Calls ``GET /v1/audit/records/{doc_id}`` and returns the document's
+        ordered audit records, each carrying a cryptographic :class:`AuditProof`
+        for ledger-sourced events. The endpoint is tenant-scoped by the API key
+        and takes no partition parameter. Raises the same not-found error as
+        :meth:`get` (404) when the document is unknown.
+        """
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        resp = await self._request_with_retry("GET", f"/audit/records/{quote(doc_id)}")
+        self._raise_for_status(resp)
+        body = resp.json()
+        return [AetherClient._parse_audit_record(r) for r in body.get("records", [])]
 
     async def download(self, doc_id: str, output_path: str | Path) -> int:
         """Download a document to a file. Returns bytes written."""
         if not doc_id:
             raise ValueError("doc_id cannot be empty")
-        resp = await self._request_with_retry("GET",f"/documents/{quote(doc_id)}/download")
+        resp = await self._request_with_retry(
+            "GET", _with_partition_guard(f"/documents/{quote(doc_id)}/download", self._partition)
+        )
         self._raise_for_status(resp)
         path = Path(output_path)
         path.write_bytes(resp.content)
@@ -580,7 +619,9 @@ class AsyncAetherClient:
         """Download a document and return its content as text."""
         if not doc_id:
             raise ValueError("doc_id cannot be empty")
-        resp = await self._request_with_retry("GET",f"/documents/{quote(doc_id)}/download")
+        resp = await self._request_with_retry(
+            "GET", _with_partition_guard(f"/documents/{quote(doc_id)}/download", self._partition)
+        )
         self._raise_for_status(resp)
         return resp.content.decode("utf-8")
 
@@ -655,6 +696,71 @@ class AsyncAetherClient:
             has_more=body.get("has_more", False),
         )
 
+    async def query(
+        self,
+        *,
+        filter: MetadataFilter | None = None,
+        group_by: list[str] | None = None,
+        aggregate: list[dict] | None = None,
+        sort: list[dict] | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+        partition: str | None = None,
+    ) -> Union[DocumentPage, AggregateResult]:
+        """Run a structured analytical query. See
+        :meth:`aether.AetherClient.query` for the full semantics.
+
+        **Mode A** (no ``aggregate``) returns a :class:`DocumentPage`; **Mode B**
+        (with ``aggregate``) returns an :class:`AggregateResult`. Exact and
+        deterministic; never consults an embedding. A 400 is raised for an unknown
+        field, a type mismatch, or a guardrail breach (never a truncated result).
+        """
+        body: dict[str, Any] = {}
+        if filter is not None:
+            body["filter"] = filter
+        if group_by:
+            body["group_by"] = group_by
+        if aggregate:
+            body["aggregate"] = aggregate
+        if sort:
+            body["sort"] = sort
+        if limit is not None:
+            body["limit"] = limit
+        if offset:
+            body["offset"] = offset
+        scope = self._partition or partition
+        if scope:
+            body["partition"] = scope
+
+        resp = await self._request_with_retry("POST", "/query", json=body)
+        self._raise_for_status(resp)
+        data = resp.json()
+        if aggregate:
+            grps = [
+                QueryGroup(keys=g.get("keys", {}), aggregates=g.get("aggregates", {}))
+                for g in data.get("groups", [])
+            ]
+            return AggregateResult(
+                groups=grps,
+                total_groups=data.get("total_groups", len(grps)),
+                scanned=data.get("scanned", 0),
+            )
+        documents = [
+            self._parse_document_record({"cid": "", **d})
+            for d in data.get("documents", [])
+        ]
+        return DocumentPage(
+            documents,
+            total=data.get("total", len(documents)),
+            has_more=data.get("has_more", False),
+        )
+
+    @property
+    def schema(self) -> AsyncSchemaClient:
+        """Field-schema facade — declare / list / delete typed fields. See
+        :class:`~aether.schema.AsyncSchemaClient`."""
+        return AsyncSchemaClient(self)
+
     async def delete(self, doc_id: str, hard: bool = False) -> None:
         """Delete a document.
 
@@ -671,14 +777,16 @@ class AsyncAetherClient:
         path = f"/documents/{quote(doc_id)}"
         if hard:
             path += "?hard=true"
-        resp = await self._request_with_retry("DELETE", path)
+        resp = await self._request_with_retry("DELETE", _with_partition_guard(path, self._partition))
         self._raise_for_status(resp)
 
     async def restore(self, doc_id: str) -> None:
         """Restore a tombstoned document."""
         if not doc_id:
             raise ValueError("doc_id cannot be empty")
-        resp = await self._request_with_retry("POST",f"/documents/{quote(doc_id)}/restore")
+        resp = await self._request_with_retry(
+            "POST", _with_partition_guard(f"/documents/{quote(doc_id)}/restore", self._partition)
+        )
         self._raise_for_status(resp)
 
     async def backfill_entity_from_tags(
@@ -696,13 +804,20 @@ class AsyncAetherClient:
         are left alone unless *overwrite* is True. Metadata-only — documents
         are not re-embedded.
 
+        Under a partition handle the scan is constrained to that partition;
+        a multi-tenant key requires the scope.
+
         Returns an :class:`EntityBackfillReport` with per-document outcome
         counts.
         """
         if not tag_prefix:
             raise ValueError("tag_prefix cannot be empty")
         body: dict = {"tag_prefix": tag_prefix, "overwrite": overwrite}
-        resp = await self._request_with_retry("POST", "/documents/backfill-entity", json=body)
+        resp = await self._request_with_retry(
+            "POST",
+            _with_partition_guard("/documents/backfill-entity", self._partition),
+            json=body,
+        )
         self._raise_for_status(resp)
         r = resp.json()
         return EntityBackfillReport(
@@ -713,6 +828,44 @@ class AsyncAetherClient:
             skipped_ambiguous=r["skipped_ambiguous"],
             skipped_invalid=r["skipped_invalid"],
         )
+
+    async def move_document(
+        self,
+        doc_id: str,
+        *,
+        from_partition: str | None,
+        to_partition: str | None,
+    ) -> DocumentRecord:
+        """Move a document between partitions (metadata-only).
+
+        The only way to re-home a document across named partitions.
+        *from_partition* asserts where the document lives **now**;
+        *to_partition* names the destination. ``None`` means the default
+        partition for either — both are always passed explicitly, so a move
+        can never be aimed by a forgotten or implicit scope (a partition
+        handle deliberately does **not** scope this call). Content, ``cid``,
+        chunks and vectors are unchanged (no re-embed); ``version``
+        increments on a real move.
+
+        A wrong *from_partition* assertion, a missing id, or a tombstoned
+        document all surface the identical not-found error — the call never
+        reveals which partition a document lives in.
+        ``to_partition == from_partition`` is an idempotent no-op.
+
+        Returns the updated :class:`DocumentRecord`.
+        """
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        if from_partition is not None:
+            _validate_partition(from_partition)
+        if to_partition is not None:
+            _validate_partition(to_partition)
+        body: dict = {"to_partition": to_partition, "expect_partition": from_partition}
+        resp = await self._request_with_retry(
+            "POST", f"/documents/{quote(doc_id)}/move", json=body
+        )
+        self._raise_for_status(resp)
+        return self._parse_document_record(resp.json())
 
     # ── Search ────────────────────────────────────────────────────────
 
@@ -736,6 +889,7 @@ class AsyncAetherClient:
             entity_id=r.get("entity_id"),
             tags=list(r.get("tags") or []),
             source=r.get("source"),
+            partition=r.get("partition"),
             metadata=dict(r.get("metadata") or {}),
             created_at=r.get("created_at"),
             updated_at=r.get("updated_at"),
@@ -1050,6 +1204,7 @@ class AsyncAetherClient:
                 entity_id=r.entity_id,
                 tags=r.tags,
                 source=r.source,
+                partition=r.partition,
                 metadata=r.metadata,
                 created_at=r.created_at,
                 updated_at=r.updated_at,
