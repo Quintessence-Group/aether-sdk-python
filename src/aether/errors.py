@@ -74,6 +74,16 @@ class PartitionRequiredError(AetherApiError):
     """
 
 
+class PrincipalPinMismatchError(AetherApiError):
+    """Raised when an API key that is pinned to an acting principal receives a
+    request asserting a *different* principal (HTTP 403,
+    ``code="principal_pin_mismatch"``). A pinned key always acts as exactly its
+    pinned principal: issue the call without ``as_principal(...)`` (or with the
+    matching principal), or use an unpinned key. Not retryable: it is a
+    programming error, not a transient failure.
+    """
+
+
 def aether_api_error_from_response(
     status_code: int,
     message: str,
@@ -92,6 +102,8 @@ def aether_api_error_from_response(
         cls = FreeLimitExceededError
     elif status_code == 403 and error_code == "tenant_paused":
         cls = TenantPausedError
+    elif status_code == 403 and error_code == "principal_pin_mismatch":
+        cls = PrincipalPinMismatchError
     elif status_code == 400 and error_code == "partition_required":
         cls = PartitionRequiredError
     else:

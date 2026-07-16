@@ -53,11 +53,36 @@ class DocumentRecord:
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     entity_id: Optional[str] = None
+    #: Conversation identity when this document is an AET-151 thread turn.
+    thread_id: Optional[str] = None
+    #: Zero-based, server-assigned position within ``thread_id``.
+    turn_index: Optional[int] = None
     tags: list[str] = field(default_factory=list)
     source: Optional[str] = None
     #: Partition the document lives in, echoed back by the engine on every
     #: document response. ``None`` means the default partition (mirrors the
     #: ``entity_id``/``source`` convention).
+    partition: Optional[str] = None
+    metadata: Metadata = field(default_factory=dict)
+    #: ``image`` or ``audio`` for a multimodal memory, else ``None``.
+    modality: Optional[str] = None
+    #: Indexed caption/transcript for a multimodal memory. Original media bytes
+    #: remain available through ``download``.
+    derived_text: Optional[str] = None
+
+
+@dataclass
+class MediaMemoryRecord:
+    """Result of storing an image or audio memory."""
+
+    doc_id: str
+    cid: str
+    modality: str
+    content_type: str
+    derived_text: str
+    derived_by: str
+    created_at: Optional[str] = None
+    entity_id: Optional[str] = None
     partition: Optional[str] = None
     metadata: Metadata = field(default_factory=dict)
 
@@ -89,27 +114,159 @@ class AuditProof:
 
 @dataclass
 class AuditRecord:
-    """One entry in a document's signed provenance/lineage trail.
+    """One audit record in the shared envelope used by both audit surfaces.
 
-    Returned by :meth:`AetherClient.lineage`. ``proof`` is always present for
-    ``source == "ledger"`` records but is modelled as optional so records from
-    other sources (or older servers) still parse.
+    Returned by :meth:`AetherClient.lineage` (``source == "ledger"``: signed
+    provenance events, each carrying a cryptographic :class:`AuditProof`) and
+    by :meth:`AuditClient.access` (``source == "access"``: the operational
+    access-audit log — reads, search deliveries, denials, and admin bypasses —
+    which carries no proof).
     """
 
     #: RFC 3339 timestamp of when the event occurred.
     at: str
-    #: Who performed the action (e.g. ``node:<hex>``).
+    #: Who performed the action. For ledger records this is the signing node
+    #: (``node:<hex>``); for access records it is the asserted acting principal
+    #: (e.g. ``user:alice``), or ``key:<prefix>`` when no principal was asserted.
     actor: str
-    #: The action taken (e.g. ``document.inserted``).
+    #: The action taken (e.g. ``document.inserted``; access records use
+    #: ``read`` / ``search_hit`` / ``denied`` / ``admin_bypass``).
     action: str
     #: The resource acted upon (e.g. ``document:<uuid>``).
     resource: str
-    #: The outcome of the action (e.g. ``committed``).
+    #: The outcome of the action (``committed`` for ledger records; ``ok`` /
+    #: ``denied`` / ``admin_bypass`` for access records).
     outcome: str
-    #: Where this record came from (e.g. ``ledger``).
+    #: Which audit surface produced this record: ``ledger`` or ``access``.
     source: str
-    #: Cryptographic proof for the record, or ``None`` when absent.
+    #: Cryptographic proof for the record (present for ``ledger`` records), or
+    #: ``None`` when absent (``access`` records carry no proof).
     proof: Optional[AuditProof] = None
+
+
+class AccessAuditPage(list):
+    """A page of access-audit records returned by :meth:`AuditClient.access`.
+
+    Subclasses :class:`list`, so it behaves exactly like a
+    ``list[AuditRecord]`` (iteration, indexing, ``len()``), while also exposing
+    the total match count for paging (mirrors :class:`DocumentPage`).
+
+    Attributes:
+        total: Total records matching the filter across all pages (ignores
+            ``limit`` / ``offset``).
+    """
+
+    def __init__(self, records=(), total: int = 0):
+        super().__init__(records)
+        self.total = total
+
+
+@dataclass
+class GroundingSource:
+    """One tenant-private source in a declared answer-grounding set.
+
+    This detail is returned only to the authenticated caller. It is intentionally
+    absent from an optional public :class:`ShareableReceipt`.
+    """
+
+    document_id: str
+    content_id: str
+    rank: int
+    retained_signed_event_count: int
+    current_content_verified: bool
+    #: Existing lineage evidence for this current CID. It is engine-verified
+    #: traceability data, not a standalone LedgerEvent signing transcript.
+    proof: Optional[AuditProof] = None
+
+
+@dataclass
+class GroundingTrustSignal:
+    """Integrity state for a declared grounding set.
+
+    ``verified`` means every current source CID was anchored by a retained,
+    valid Ed25519 event when the receipt was created. It does not assess factual
+    correctness or prove how an external model reasoned from a source.
+    """
+
+    status: str
+    sources_requested: int
+    sources_verified: int
+    answer_bound: bool
+
+
+@dataclass
+class GroundingBinding:
+    """Authenticated-only material for an opaque receipt commitment.
+
+    ``verification_salt`` is returned only to the authenticated creator and is
+    never persisted or emitted by a public receipt URL. Retain it with the
+    original answer/source result if you need to recompute the commitment.
+    """
+
+    algorithm: str
+    source_set_commitment: str
+    source_evidence_commitment: str
+    binding_commitment: str
+    verification_salt: str
+
+
+@dataclass
+class ReceiptAttestation:
+    """Publicly checkable Ed25519 node attestation over public receipt fields."""
+
+    signer_node_id: str
+    signer_public_key: str
+    signature: str
+    verified: bool
+
+
+@dataclass
+class GroundingSetAttestation:
+    """Ed25519 attestation over every authenticated grounding result."""
+
+    version: str
+    issued_at: str
+    binding_algorithm: str
+    signer_node_id: str
+    signer_public_key: str
+    signature: str
+    verified: bool
+
+
+@dataclass
+class ShareableReceipt:
+    """Public-safe, revocable share-link metadata returned after ``share=True``.
+
+    The public link exposes aggregate verification state only: never answer
+    text/digest, tenant id, document ids, CIDs, titles, passages, or ledger
+    event bytes.
+    """
+
+    version: str
+    receipt_id: str
+    issued_at: str
+    expires_at: str
+    source_count: int
+    verified_source_count: int
+    status: str
+    binding_commitment: str
+    capability_commitment: str
+    owner_commitment: str
+    attestation: ReceiptAttestation
+    share_url: str
+    badge_url: str
+
+
+@dataclass
+class GroundingReceipt:
+    """Authenticated AET-348 answer-grounding provenance response."""
+
+    answer_digest: str
+    sources: list[GroundingSource]
+    trust: GroundingTrustSignal
+    binding: GroundingBinding
+    attestation: GroundingSetAttestation
+    receipt: Optional[ShareableReceipt] = None
 
 
 @dataclass
@@ -126,6 +283,10 @@ class SearchResult:
     #: belongs to, echoed back by the engine on every hit. ``None`` if the
     #: document has no associated entity.
     entity_id: Optional[str] = None
+    #: Conversation identity when this hit is an AET-151 thread turn.
+    thread_id: Optional[str] = None
+    #: Zero-based, server-assigned position within ``thread_id``.
+    turn_index: Optional[int] = None
     tags: list[str] = field(default_factory=list)
     source: Optional[str] = None
     #: Partition the matched document lives in, echoed back by the engine on
@@ -139,11 +300,21 @@ class SearchResult:
     #: ``None`` if it has never been updated since insert. Lets a caller spot
     #: a freshly-superseded hit without a second ``get`` round-trip.
     updated_at: Optional[str] = None
+    #: ``image`` or ``audio`` when this hit is a multimodal memory.
+    modality: Optional[str] = None
     #: Feedback handle for the search that returned this hit. Present only
     #: when usage-feedback capture is enabled for your tenant (``None``
     #: otherwise); pass it to ``send_search_feedback`` together with this
     #: hit's ``doc_id``.
     query_id: Optional[str] = None
+
+
+@dataclass
+class ConversationThread:
+    """Canonical tenant-scoped AET-151 conversation in turn order."""
+
+    thread_id: str
+    documents: list[DocumentRecord] = field(default_factory=list)
 
 
 @dataclass
@@ -192,6 +363,10 @@ class RetrievalResult:
     passage: Optional[str] = None
     #: Identifier of the entity the matched document belongs to, if any.
     entity_id: Optional[str] = None
+    #: Conversation identity when this result is an AET-151 thread turn.
+    thread_id: Optional[str] = None
+    #: Zero-based, server-assigned position within ``thread_id``.
+    turn_index: Optional[int] = None
     tags: list[str] = field(default_factory=list)
     source: Optional[str] = None
     #: Partition the matched document lives in; ``None`` means the default
@@ -201,6 +376,8 @@ class RetrievalResult:
     created_at: Optional[str] = None
     #: RFC 3339 timestamp of the document's last update, or ``None``.
     updated_at: Optional[str] = None
+    #: ``image`` or ``audio`` when this result is a multimodal memory.
+    modality: Optional[str] = None
 
 
 class DocumentPage(list):
@@ -230,6 +407,10 @@ class BatchInsertItem:
     entity_id: Optional[str] = None
     source: Optional[str] = None
     metadata: Optional[Metadata] = None
+    #: Read-ACL for this document: ``user:`` / ``group:`` labels naming who may
+    #: read it. ``None`` (default) leaves it unlabeled / tenant-visible; an
+    #: explicit empty list quarantines it to admin-role keys only.
+    acl_readers: Optional[list[str]] = None
 
 @dataclass
 class BatchSearchQuery:
@@ -256,6 +437,9 @@ class BatchSearchQuery:
     freshness_weight: Optional[float] = None
     #: Freshness half-life in days (server default 14); see ``search``.
     freshness_half_life_days: Optional[float] = None
+    #: Restrict results to one canonical conversation thread. Kept last so
+    #: existing positional construction retains its prior argument mapping.
+    thread_id: Optional[str] = None
 
 @dataclass
 class BatchSearchResponse:

@@ -12,6 +12,12 @@ from aether import (
     AuditRecord,
     DocumentRecord,
     EntityBackfillReport,
+    GroundingBinding,
+    GroundingReceipt,
+    GroundingSetAttestation,
+    GroundingSource,
+    ReceiptAttestation,
+    ShareableReceipt,
     IngestResult,
     RetrievalResult,
 )
@@ -25,6 +31,17 @@ def _ok_response(**kwargs):
     resp.status_code = 200
     for k, v in kwargs.items():
         setattr(resp, k, v)
+    return resp
+
+
+def _error_response(status_code: int, message: str):
+    """Create a retryable mock response carrying a stable first error."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.is_success = False
+    resp.status_code = status_code
+    resp.headers = {}
+    resp.reason_phrase = "Bad Gateway" if status_code == 502 else "Service Unavailable"
+    resp.json.return_value = {"error": message}
     return resp
 
 
@@ -586,6 +603,188 @@ class TestLineage:
             client.lineage("")
 
 
+class TestGroundingReceipts:
+    _PAYLOAD = {
+        "answer_digest": "blake3:answer-commitment",
+        "sources": [{
+            "document_id": "doc-1",
+            "content_id": "aether:private-cid",
+            "rank": 0,
+            "retained_signed_event_count": 2,
+            "current_content_verified": True,
+            "proof": {
+                "content_id": "aether:private-cid",
+                "lamport": 42,
+                "node_id": "source-node-id",
+                "public_key": "source-public-key",
+                "signature": "source-signature",
+                "verified": True,
+            },
+        }],
+        "trust": {
+            "status": "verified",
+            "sources_requested": 1,
+            "sources_verified": 1,
+            "answer_bound": True,
+        },
+        "binding": {
+            "algorithm": "blake3-keyed/aether-grounding-binding/v1",
+            "source_set_commitment": "blake3:sources",
+            "source_evidence_commitment": "blake3:evidence",
+            "binding_commitment": "opaque-binding",
+            "verification_salt": "authenticated-only-salt",
+        },
+        "attestation": {
+            "version": "aether-grounding-set-attestation/v1",
+            "issued_at": "2026-07-10T00:00:00Z",
+            "binding_algorithm": "blake3-keyed/aether-grounding-binding/v1",
+            "signer_node_id": "grounding-node-id",
+            "signer_public_key": "grounding-public-key",
+            "signature": "grounding-signature",
+            "verified": True,
+        },
+        "receipt": {
+            "version": "aether-grounding-receipt/v2",
+            "receipt_id": "receipt-1",
+            "issued_at": "2026-07-10T00:00:00Z",
+            "expires_at": "2026-08-09T00:00:00Z",
+            "source_count": 1,
+            "verified_source_count": 1,
+            "status": "verified",
+            "binding_commitment": "opaque-binding",
+            "capability_commitment": "blake3:capability",
+            "owner_commitment": "blake3:owner",
+            "attestation": {
+                "signer_node_id": "node-id",
+                "signer_public_key": "public-key",
+                "signature": "signature",
+                "verified": True,
+            },
+            "share_url": "/receipts/capability",
+            "badge_url": "/receipts/capability/badge.svg",
+        },
+    }
+
+    def test_creates_typed_grounding_receipt_and_posts_wire_shape(self, client):
+        resp = _ok_response()
+        resp.json.return_value = self._PAYLOAD
+        with patch.object(client._client, "request", return_value=resp) as mock_req:
+            result = client.create_grounding_receipt(
+                "private answer", ["doc-1"], share=True
+            )
+
+        assert isinstance(result, GroundingReceipt)
+        assert result.answer_digest == "blake3:answer-commitment"
+        assert isinstance(result.sources[0], GroundingSource)
+        assert result.sources[0].content_id == "aether:private-cid"
+        assert isinstance(result.sources[0].proof, AuditProof)
+        assert result.sources[0].proof.lamport == 42
+        assert result.trust.status == "verified"
+        assert isinstance(result.binding, GroundingBinding)
+        assert result.binding.source_evidence_commitment == "blake3:evidence"
+        assert result.binding.binding_commitment == "opaque-binding"
+        assert isinstance(result.attestation, GroundingSetAttestation)
+        assert result.attestation.signature == "grounding-signature"
+        assert result.attestation.verified is True
+        assert result.receipt is not None
+        assert isinstance(result.receipt, ShareableReceipt)
+        assert result.receipt.share_url == "/receipts/capability"
+        assert result.receipt.capability_commitment == "blake3:capability"
+        assert result.receipt.owner_commitment == "blake3:owner"
+        assert isinstance(result.receipt.attestation, ReceiptAttestation)
+        assert result.receipt.attestation.verified is True
+        method, url = mock_req.call_args.args[:2]
+        assert method == "POST"
+        assert url == "/v1/audit/grounding"
+        assert mock_req.call_args.kwargs["json"] == {
+            "answer": "private answer",
+            "source_doc_ids": ["doc-1"],
+            "share": True,
+        }
+
+    @pytest.mark.parametrize("status_code", [502, 503])
+    def test_shareable_receipt_does_not_retry_transient_response(self, status_code):
+        first = _error_response(status_code, f"first-{status_code}")
+        success = _ok_response()
+        success.json.return_value = {"answer_digest": "unexpected"}
+        with AetherClient(
+            base_url="http://localhost:9000",
+            max_retries=2,
+            retry_base_delay=0,
+        ) as retry_client:
+            with patch.object(
+                retry_client._client, "request", side_effect=[first, success]
+            ) as mock_req:
+                with pytest.raises(AetherApiError) as exc_info:
+                    retry_client.create_grounding_receipt(
+                        "answer", ["doc-1"], share=True
+                    )
+
+        assert exc_info.value.status_code == status_code
+        assert exc_info.value.message == f"first-{status_code}"
+        assert mock_req.call_count == 1
+
+    @pytest.mark.parametrize("status_code", [502, 503])
+    def test_private_receipt_retains_transient_retry(self, status_code):
+        first = _error_response(status_code, f"transient-{status_code}")
+        success = _ok_response()
+        success.json.return_value = {"answer_digest": "blake3:retried"}
+        with AetherClient(
+            base_url="http://localhost:9000",
+            max_retries=2,
+            retry_base_delay=0,
+        ) as retry_client:
+            with patch.object(
+                retry_client._client, "request", side_effect=[first, success]
+            ) as mock_req:
+                result = retry_client.create_grounding_receipt(
+                    "answer", ["doc-1"]
+                )
+
+        assert result.answer_digest == "blake3:retried"
+        assert mock_req.call_count == 2
+
+    def test_non_shareable_receipt_omits_receipt_field_and_revoke_uses_void_delete(self, client):
+        create_resp = _ok_response()
+        create_resp.json.return_value = {
+            **self._PAYLOAD,
+            "receipt": None,
+        }
+        revoke_resp = _ok_response()
+        with patch.object(
+            client._client, "request", side_effect=[create_resp, revoke_resp]
+        ) as mock_req:
+            result = client.create_grounding_receipt("answer", ["doc-1"])
+            client.revoke_grounding_receipt("receipt-1")
+
+        assert result.receipt is None
+        assert mock_req.call_args_list[0].args[:2] == ("POST", "/v1/audit/grounding")
+        assert mock_req.call_args_list[0].kwargs["json"] == {
+            "answer": "answer", "source_doc_ids": ["doc-1"]
+        }
+        assert mock_req.call_args_list[1].args[:2] == (
+            "DELETE", "/v1/audit/receipts/receipt-1"
+        )
+
+    @pytest.mark.parametrize("answer, source_doc_ids", [("", ["doc-1"]), ("answer", [])])
+    def test_validates_required_grounding_inputs(self, client, answer, source_doc_ids):
+        with pytest.raises(ValueError):
+            client.create_grounding_receipt(answer, source_doc_ids)
+
+    def test_partition_handle_scopes_grounding_create_and_revoke(self, client):
+        response = _ok_response()
+        response.json.return_value = {**self._PAYLOAD, "receipt": None}
+        revoke = _ok_response()
+        scoped = client.partition("customer-a")
+        with patch.object(scoped._client, "request", side_effect=[response, revoke]) as mock_req:
+            scoped.create_grounding_receipt("answer", ["doc-1"])
+            scoped.revoke_grounding_receipt("receipt-1")
+        assert mock_req.call_args_list[0].kwargs["json"]["partition"] == "customer-a"
+        assert mock_req.call_args_list[1].args[:2] == (
+            "DELETE", "/v1/audit/receipts/receipt-1?partition=customer-a"
+        )
+
+
 class TestInsertEntityId:
     def _insert_resp(self, **extra):
         resp = _ok_response()
@@ -1083,12 +1282,13 @@ class TestPartitionHandle:
         resp.json.return_value = {"results": []}
         with patch.object(client._client, "request", return_value=resp) as mock_req:
             client.partition("tenant-a").batch_search([
-                BatchSearchQuery(q="one"),
-                BatchSearchQuery(q="two"),
+                BatchSearchQuery(q="one", thread_id="thread-one"),
+                BatchSearchQuery(q="two", thread_id="thread-two"),
             ])
 
         queries = mock_req.call_args[1]["json"]["queries"]
         assert [q["partition"] for q in queries] == ["tenant-a", "tenant-a"]
+        assert [q["thread_id"] for q in queries] == ["thread-one", "thread-two"]
 
     def test_insert_sends_partition_query(self, client, tmp_path):
         f = tmp_path / "doc.txt"

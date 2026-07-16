@@ -163,6 +163,7 @@ def test_batch_search_serializes_filters(client):
                 q="filtered",
                 k=5,
                 entity_id="user-123",
+                thread_id="support-42",
                 since="2026-06-01T00:00:00Z",
                 until="2026-06-10T23:59:59Z",
                 max_distance=0.3,
@@ -173,14 +174,23 @@ def test_batch_search_serializes_filters(client):
 
     queries = mock_req.call_args[1]["json"]["queries"]
     assert queries[0]["entity_id"] == "user-123"
+    assert queries[0]["thread_id"] == "support-42"
     assert queries[0]["since"] == "2026-06-01T00:00:00Z"
     assert queries[0]["until"] == "2026-06-10T23:59:59Z"
     assert queries[0]["max_distance"] == 0.3
     assert "last_n_days" not in queries[0]
     assert queries[1]["last_n_days"] == 7
     assert "since" not in queries[1]
-    for key in ("entity_id", "since", "until", "last_n_days", "max_distance"):
+    for key in ("entity_id", "thread_id", "since", "until", "last_n_days", "max_distance"):
         assert key not in queries[2]
+
+
+def test_batch_search_rejects_invalid_thread_id_before_request(client):
+    with patch.object(client._client, "request") as mock_req:
+        with pytest.raises(ValueError, match="thread_id"):
+            client.batch_search([BatchSearchQuery(q="test", thread_id="bad\x00thread")])
+
+    mock_req.assert_not_called()
 
 
 def test_batch_search_serializes_freshness(client):

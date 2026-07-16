@@ -65,6 +65,40 @@ for doc in client.list():
     print(f"  {doc.doc_id}: {doc.title}")
 ```
 
+## Per-user permissions & audit
+
+Restrict who can read a document, then scope a client to act on behalf of a
+principal so reads are filtered by each document's ACL:
+
+```python
+from aether import AetherClient, PrincipalPinMismatchError
+
+client = AetherClient(api_key="aether_your_key_here")
+
+# Write with a read-ACL — only alice and the eng group can read this document.
+# Omit acl_readers (or pass []) for the admin-only default.
+doc = client.insert_text(
+    "Q3 board deck notes",
+    acl_readers=["user:alice", "group:eng"],
+)
+
+# Act as a principal: searches and reads only surface documents this principal
+# is allowed to see. Composes with client.partition(...).
+alice = client.as_principal("user:alice", groups=["group:eng"])
+for r in alice.search("board deck", k=5):
+    print(r.doc_id, r.score)
+
+# Query the tenant's access-audit log (requires audit capture to be enabled).
+page = client.audit.access(action="read", limit=100)
+print(f"{page.total} read events")
+for rec in page:
+    print(rec.at, rec.actor, rec.action, rec.resource)
+```
+
+A principal-pinned API key that is asked to assert a different principal raises
+`PrincipalPinMismatchError`. `AsyncAetherClient` mirrors the same surface with
+`await`.
+
 ## Supported File Formats
 
 Aether automatically extracts clean text from binary documents before embedding. No need to specify `content_type` -- it's guessed from the file extension.

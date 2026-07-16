@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import base64
 import json
 import mimetypes
 import os
@@ -15,12 +16,14 @@ from urllib.parse import quote
 import httpx
 
 from ._internal import USER_AGENT, enforce_secure_base_url, new_idempotency_key
-from .errors import AetherApiError, AetherNetworkError, aether_api_error_from_response
+from .errors import AetherApiError, AetherError, AetherNetworkError, aether_api_error_from_response
 from .schema import SchemaClient
 
 # A partition id must be non-empty and at most this many characters, matching
 # the server's constraint. Validated client-side before any HTTP call.
 _MAX_PARTITION_LEN = 256
+_MAX_THREAD_ID_LEN = 256
+_MAX_THREAD_READ_TURNS = 1_000
 
 # Canonical public API version prefix. Every data route (documents, search,
 # memory, partitions, archive) is served under this prefix. The public probe
@@ -61,6 +64,102 @@ def _validate_partition(partition_id: str) -> str:
     return partition_id
 
 
+def _validate_principal(principal: str) -> str:
+    """Validate an acting-principal label client-side (never a round-trip).
+
+    Mirrors the partition validation style: reject empty/whitespace-only
+    labels with a ``ValueError``. The label is trimmed, matching the server's
+    treatment of surrounding whitespace.
+    """
+    if not isinstance(principal, str) or not principal.strip():
+        raise ValueError("principal cannot be empty")
+    return principal.strip()
+
+
+def _clean_groups(groups: "list[str] | None") -> list[str]:
+    """Trim group labels and drop blanks (the server ignores blanks too).
+
+    A group label containing a comma is rejected with a ``ValueError``: groups
+    travel comma-joined on the wire, so a comma would silently split one
+    asserted group into several — widening the read scope of the assertion.
+    """
+    if not groups:
+        return []
+    cleaned: list[str] = []
+    for g in groups:
+        if not isinstance(g, str) or not g.strip():
+            continue
+        if "," in g:
+            raise ValueError(f"group label cannot contain a comma: {g!r}")
+        cleaned.append(g.strip())
+    return cleaned
+
+
+def _validate_acl_readers(acl_readers: "list[str]") -> "list[str]":
+    """Validate read-ACL reader labels client-side (never a round-trip).
+
+    Labels are opaque, but two shapes are rejected loudly because the wire
+    encoding would silently change their meaning: a label containing a comma
+    (the document routes are comma-joined, so one label would become several —
+    widening the ACL), and an empty/blank label (the server drops blanks, so
+    ``[""]`` would silently collapse into the admin-only quarantine state).
+    """
+    for label in acl_readers:
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(
+                "acl_readers labels cannot be empty; pass [] for the "
+                "admin-only quarantine state or None to leave unlabeled"
+            )
+        if "," in label:
+            raise ValueError(f"acl_readers label cannot contain a comma: {label!r}")
+    return acl_readers
+
+
+def _acl_readers_param(acl_readers: "list[str] | None") -> Optional[str]:
+    """Encode an ``acl_readers`` list for the wire (comma-separated).
+
+    The three states are distinct and all meaningful: ``None`` -> omit the
+    param (document stays unlabeled / tenant-visible); ``[]`` -> an explicit
+    empty value (document is quarantined to admin-role keys only);
+    ``["user:a", "group:b"]`` -> readable by those labels.
+    """
+    if acl_readers is None:
+        return None
+    return ",".join(_validate_acl_readers(acl_readers))
+
+
+def _validate_thread_id(thread_id: str) -> str:
+    """Validate a thread path identity locally before making a request."""
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        raise ValueError("thread_id cannot be empty")
+    if thread_id in {".", ".."}:
+        raise ValueError("thread_id cannot be a reserved URL dot segment")
+    if any(ord(char) <= 0x1F or 0x7F <= ord(char) <= 0x9F for char in thread_id):
+        raise ValueError("thread_id cannot contain control characters")
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in thread_id):
+        raise ValueError("thread_id cannot contain unpaired surrogate code points")
+    if len(thread_id) > _MAX_THREAD_ID_LEN:
+        raise ValueError(
+            f"thread_id must be at most {_MAX_THREAD_ID_LEN} characters "
+            f"(got {len(thread_id)})"
+        )
+    return thread_id
+
+
+def _validate_thread_read_window(last_n_turns: int | None) -> None:
+    """Validate the server's bounded conversation context window locally."""
+    if last_n_turns is None:
+        return
+    if (
+        isinstance(last_n_turns, bool)
+        or not isinstance(last_n_turns, int)
+        or not 1 <= last_n_turns <= _MAX_THREAD_READ_TURNS
+    ):
+        raise ValueError(
+            f"last_n_turns must be an integer between 1 and {_MAX_THREAD_READ_TURNS}"
+        )
+
+
 def _with_partition_guard(url: str, partition: Optional[str]) -> str:
     """Append the partition guard query param to an ID-addressed route.
 
@@ -74,6 +173,7 @@ def _with_partition_guard(url: str, partition: Optional[str]) -> str:
     return f"{url}{sep}partition={quote(partition)}"
 
 
+from .audit import AuditClient
 from .models import (
     AggregateResult,
     AuditProof,
@@ -83,20 +183,29 @@ from .models import (
     BatchSearchResponse,
     DocumentPage,
     DocumentRecord,
+    ConversationThread,
     QueryGroup,
     EntityBackfillReport,
+    GroundingReceipt,
+    GroundingBinding,
+    GroundingSetAttestation,
+    GroundingSource,
+    GroundingTrustSignal,
     IngestResult,
     IsolationCheck,
     Metadata,
     MetadataFilter,
+    MediaMemoryRecord,
     NodeStatus,
     resolve_content_type,
     PartitionInfo,
     PartitionList,
     PartitionWarning,
+    ReceiptAttestation,
     RetrievalResult,
     SearchResult,
     SearchTrace,
+    ShareableReceipt,
     TracedSearch,
 )
 
@@ -136,6 +245,12 @@ class AetherClient:
         # scoped clone produced by ``partition()``. When set it is injected into
         # every partition-aware read/write so a partition can never be forgotten.
         self._partition: Optional[str] = None
+        # Acting-principal scope: None/[] on the base client (no assertion).
+        # Set on a scoped clone produced by ``as_principal()``. When set they
+        # are injected as ``acting_principal`` / ``acting_groups`` query params
+        # on every request, so an assertion can never be forgotten.
+        self._acting_principal: Optional[str] = None
+        self._acting_groups: list[str] = []
         # Ownership: the base client owns and closes the transport; a scoped
         # clone shares it and must not close it (mirrors the Memory facade's
         # ``_owns_client`` pattern).
@@ -172,6 +287,54 @@ class AetherClient:
         scoped._owns_transport = False
         return scoped
 
+    def as_principal(
+        self, principal: str, groups: list[str] | None = None
+    ) -> "AetherClient":
+        """Return a clone of this client scoped to an acting principal.
+
+        Every request on the returned handle asserts that it is made on behalf
+        of *principal* (e.g. ``"user:alice"``), optionally acting with *groups*
+        (e.g. ``["group:eng"]``), by carrying ``acting_principal`` /
+        ``acting_groups`` on the wire. Reads through the handle are then
+        filtered by each document's read-ACL (``acl_readers``): the principal
+        sees unlabeled documents plus those whose ACL names it (or one of its
+        groups), and a document it cannot read is indistinguishable from a
+        missing one. Admin-role keys bypass read-ACL filtering. The assertion
+        also becomes the ``actor`` recorded in the access-audit log.
+
+        The scope mirrors :meth:`partition` and composes with it —
+        ``client.partition("p").as_principal("user:alice")`` carries both. The
+        clone shares this client's transport and all configuration; closing
+        the clone is a no-op. Re-scoping is last-wins:
+        ``client.as_principal("user:a").as_principal("user:b")`` asserts
+        ``"user:b"``.
+
+        Under an API key that is *pinned* to a principal, a handle asserting
+        the same principal is allowed; asserting a different one fails every
+        call with :class:`~aether.PrincipalPinMismatchError` (the pin can
+        never be widened or overridden per request).
+        """
+        scoped = copy.copy(self)
+        scoped._acting_principal = _validate_principal(principal)
+        scoped._acting_groups = _clean_groups(groups)
+        scoped._owns_transport = False
+        return scoped
+
+    def _with_principal(self, url: str) -> str:
+        """Append this handle's acting-principal assertion to a request path.
+
+        A no-op on an unscoped client, which keeps pre-handle behavior
+        byte-identical. Applied at the transport boundary so every call issued
+        through an ``as_principal()`` handle carries the assertion.
+        """
+        if not self._acting_principal:
+            return url
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}acting_principal={quote(self._acting_principal)}"
+        if self._acting_groups:
+            url += f"&acting_groups={quote(','.join(self._acting_groups))}"
+        return url
+
     def _raise_for_status(self, resp: httpx.Response) -> None:
         """Raise AetherApiError or AetherNetworkError for non-2xx responses."""
         if resp.is_success:
@@ -198,15 +361,32 @@ class AetherClient:
 
         The relative *url* is rewritten under the ``/v1`` API version prefix
         here, at the transport boundary, so every caller (including the
-        Memory facade) versions its data routes in one place.
+        Memory facade) versions its data routes in one place. An
+        ``as_principal()`` handle's assertion params are injected here for the
+        same reason — every route through the handle carries them. When the
+        call supplies a ``params`` kwarg the assertion merges into it (httpx
+        replaces a URL's query string with ``params``); otherwise it is
+        appended to the URL itself.
         """
+        if self._acting_principal:
+            params = kwargs.get("params")
+            if params is not None:
+                merged = dict(params)
+                merged["acting_principal"] = self._acting_principal
+                if self._acting_groups:
+                    merged["acting_groups"] = ",".join(self._acting_groups)
+                kwargs["params"] = merged
+            else:
+                url = self._with_principal(url)
         return self._client.request(method, _versioned_path(url), **kwargs)
 
-    def _request_with_retry(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """Send an HTTP request with exponential backoff retry for transient errors."""
+    def _request_with_retry(
+        self, method: str, url: str, *, retry: bool = True, **kwargs
+    ) -> httpx.Response:
+        """Send a request, optionally retrying transient transport failures."""
         last_error: Optional[Exception] = None
         resp: Optional[httpx.Response] = None
-        max_attempts = self._max_retries + 1
+        max_attempts = self._max_retries + 1 if retry else 1
 
         # Attach a stable idempotency key to non-idempotent writes so the server
         # can deduplicate a retry whose original response was lost in transit.
@@ -250,10 +430,13 @@ class AetherClient:
             jitter = random.uniform(0, delay * 0.5)
             delay += jitter
 
-            # Respect Retry-After header for 429 responses
+            # Respect Retry-After on every retryable HTTP response. In
+            # particular, a committed thread turn may return 503 while its
+            # origin projection is catching up; Thread.context downloads must
+            # wait for that server-authored floor rather than spin or false-404.
             if (
                 isinstance(last_error, AetherApiError)
-                and last_error.status_code == 429
+                and last_error.is_retryable
                 and resp is not None
             ):
                 retry_after = resp.headers.get("retry-after")
@@ -307,8 +490,27 @@ class AetherClient:
             created_at=d.get("created_at"),
             updated_at=d.get("updated_at"),
             entity_id=d.get("entity_id"),
+            thread_id=d.get("thread_id"),
+            turn_index=d.get("turn_index"),
             tags=list(d.get("tags") or []),
             source=d.get("source"),
+            partition=d.get("partition"),
+            metadata=dict(d.get("metadata") or {}),
+            modality=d.get("modality"),
+            derived_text=d.get("derived_text"),
+        )
+
+    @staticmethod
+    def _parse_media_memory_record(d: dict) -> MediaMemoryRecord:
+        return MediaMemoryRecord(
+            doc_id=d["doc_id"],
+            cid=d.get("cid", ""),
+            modality=d.get("modality", ""),
+            content_type=d.get("content_type", ""),
+            derived_text=d.get("derived_text", ""),
+            derived_by=d.get("derived_by", ""),
+            created_at=d.get("created_at"),
+            entity_id=d.get("entity_id"),
             partition=d.get("partition"),
             metadata=dict(d.get("metadata") or {}),
         )
@@ -342,6 +544,92 @@ class AetherClient:
             proof=proof,
         )
 
+    @staticmethod
+    def _parse_grounding_receipt(d: dict) -> GroundingReceipt:
+        """Map the authenticated AET-348 grounding response to typed models.
+
+        The optional ``receipt`` is deliberately a public-safe aggregate; source
+        ids/CIDs remain in ``sources`` on this authenticated result only.
+        """
+        sources = []
+        for source in d.get("sources", []):
+            proof_raw = source.get("proof")
+            proof = None
+            if proof_raw is not None:
+                proof = AuditProof(
+                    content_id=proof_raw.get("content_id"),
+                    lamport=proof_raw.get("lamport", 0),
+                    node_id=proof_raw.get("node_id", ""),
+                    public_key=proof_raw.get("public_key", ""),
+                    signature=proof_raw.get("signature", ""),
+                    verified=proof_raw.get("verified", False),
+                )
+            sources.append(GroundingSource(
+                document_id=source["document_id"],
+                content_id=source["content_id"],
+                rank=source.get("rank", 0),
+                retained_signed_event_count=source.get("retained_signed_event_count", 0),
+                current_content_verified=source.get("current_content_verified", False),
+                proof=proof,
+            ))
+        trust_raw = d.get("trust") or {}
+        trust = GroundingTrustSignal(
+            status=trust_raw.get("status", "partial"),
+            sources_requested=trust_raw.get("sources_requested", len(sources)),
+            sources_verified=trust_raw.get("sources_verified", 0),
+            answer_bound=trust_raw.get("answer_bound", False),
+        )
+        receipt_raw = d.get("receipt")
+        binding_raw = d.get("binding") or {}
+        binding = GroundingBinding(
+            algorithm=binding_raw.get("algorithm", ""),
+            source_set_commitment=binding_raw.get("source_set_commitment", ""),
+            source_evidence_commitment=binding_raw.get("source_evidence_commitment", ""),
+            binding_commitment=binding_raw.get("binding_commitment", ""),
+            verification_salt=binding_raw.get("verification_salt", ""),
+        )
+        attestation_raw = d.get("attestation") or {}
+        attestation = GroundingSetAttestation(
+            version=attestation_raw.get("version", ""),
+            issued_at=attestation_raw.get("issued_at", ""),
+            binding_algorithm=attestation_raw.get("binding_algorithm", ""),
+            signer_node_id=attestation_raw.get("signer_node_id", ""),
+            signer_public_key=attestation_raw.get("signer_public_key", ""),
+            signature=attestation_raw.get("signature", ""),
+            verified=attestation_raw.get("verified", False),
+        )
+        receipt = None
+        if receipt_raw is not None:
+            attestation_raw = receipt_raw.get("attestation") or {}
+            receipt = ShareableReceipt(
+                version=receipt_raw.get("version", ""),
+                receipt_id=receipt_raw.get("receipt_id", ""),
+                issued_at=receipt_raw.get("issued_at", ""),
+                expires_at=receipt_raw.get("expires_at", ""),
+                source_count=receipt_raw.get("source_count", 0),
+                verified_source_count=receipt_raw.get("verified_source_count", 0),
+                status=receipt_raw.get("status", "partial"),
+                binding_commitment=receipt_raw.get("binding_commitment", ""),
+                capability_commitment=receipt_raw.get("capability_commitment", ""),
+                owner_commitment=receipt_raw.get("owner_commitment", ""),
+                attestation=ReceiptAttestation(
+                    signer_node_id=attestation_raw.get("signer_node_id", ""),
+                    signer_public_key=attestation_raw.get("signer_public_key", ""),
+                    signature=attestation_raw.get("signature", ""),
+                    verified=attestation_raw.get("verified", False),
+                ),
+                share_url=receipt_raw.get("share_url", ""),
+                badge_url=receipt_raw.get("badge_url", ""),
+            )
+        return GroundingReceipt(
+            answer_digest=d.get("answer_digest", ""),
+            sources=sources,
+            trust=trust,
+            binding=binding,
+            attestation=attestation,
+            receipt=receipt,
+        )
+
     def insert(
         self,
         file_path: str | Path,
@@ -352,6 +640,7 @@ class AetherClient:
         entity_id: str | None = None,
         source: str | None = None,
         metadata: Metadata | None = None,
+        acl_readers: list[str] | None = None,
     ) -> DocumentRecord:
         """Insert a document from a file path.
 
@@ -364,6 +653,13 @@ class AetherClient:
 
         Pass *source* to tag the document with its origin (e.g. a system or
         channel name) for later filtering on search and list.
+
+        Pass *acl_readers* to set the document's read-ACL — a list of
+        ``user:`` / ``group:`` labels (e.g. ``["user:alice", "group:eng"]``)
+        naming who may read it (enforced against the acting principal asserted
+        via :meth:`as_principal`; admin-role keys bypass). Omit (``None``) to
+        leave the document unlabeled — readable tenant-wide, the default. An
+        explicit empty list quarantines the document to admin-role keys only.
         """
         if chunk_size is not None and chunk_size < 1:
             raise ValueError("chunk_size must be at least 1")
@@ -388,6 +684,9 @@ class AetherClient:
             url += f"&source={quote(source)}"
         if metadata is not None:
             url += f"&metadata={quote(_json_query_value(metadata))}"
+        acl_param = _acl_readers_param(acl_readers)
+        if acl_param is not None:
+            url += f"&acl_readers={quote(acl_param)}"
         if self._partition:
             url += f"&partition={quote(self._partition)}"
 
@@ -406,6 +705,7 @@ class AetherClient:
         entity_id: str | None = None,
         source: str | None = None,
         metadata: Metadata | None = None,
+        acl_readers: list[str] | None = None,
         raise_on_error: bool = False,
     ) -> list[IngestResult]:
         """Ingest many files in one call.
@@ -413,7 +713,9 @@ class AetherClient:
         Each file is inserted independently with :meth:`insert`; the content
         type is resolved from the extension (``.md`` / ``.txt`` / ``.pdf`` and
         friends). Chunking uses the server defaults unless *chunk_size* /
-        *overlap* are given.
+        *overlap* are given. *tags*, *entity_id*, *source*, *metadata*, and
+        *acl_readers* are applied to every file (see :meth:`insert` for the
+        ``acl_readers`` semantics).
 
         A file the engine cannot ingest — an unsupported or binary type, or one
         that needs the server-side document parser when it is not configured, or
@@ -437,6 +739,7 @@ class AetherClient:
                     entity_id=entity_id,
                     source=source,
                     metadata=metadata,
+                    acl_readers=acl_readers,
                 )
                 results.append(
                     IngestResult(
@@ -481,6 +784,7 @@ class AetherClient:
         entity_id: str | None = None,
         source: str | None = None,
         metadata: Metadata | None = None,
+        acl_readers: list[str] | None = None,
         raise_on_error: bool = False,
     ) -> list[IngestResult]:
         """Ingest every file under *directory*.
@@ -488,7 +792,8 @@ class AetherClient:
         Walks *directory* (recursively by default) and ingests each file via
         :meth:`ingest_files`. Pass *extensions* (e.g. ``[".md", ".txt", ".pdf"]``)
         to restrict which files are loaded; leading dots and case are optional.
-        See :meth:`ingest_files` for how unsupported files are reported.
+        See :meth:`ingest_files` for how unsupported files are reported and how
+        the shared per-file options (including *acl_readers*) are applied.
         """
         base = Path(directory)
         if not base.is_dir():
@@ -512,6 +817,7 @@ class AetherClient:
             entity_id=entity_id,
             source=source,
             metadata=metadata,
+            acl_readers=acl_readers,
             raise_on_error=raise_on_error,
         )
 
@@ -526,6 +832,7 @@ class AetherClient:
         source: str | None = None,
         metadata: Metadata | None = None,
         extract_facts: bool = False,
+        acl_readers: list[str] | None = None,
     ) -> DocumentRecord:
         """Insert raw text content.
 
@@ -539,6 +846,10 @@ class AetherClient:
         server-side; each fact is stored as a sibling document tagged
         ``kind:fact`` and linked to this document. Requires fact extraction to
         be configured on the node, otherwise the request fails.
+
+        Pass *acl_readers* to set the document's read-ACL — see :meth:`insert`
+        (omit to leave the document unlabeled / tenant-visible; an explicit
+        empty list quarantines it to admin-role keys).
         """
         if chunk_size is not None and chunk_size < 1:
             raise ValueError("chunk_size must be at least 1")
@@ -559,12 +870,155 @@ class AetherClient:
             url += f"&metadata={quote(_json_query_value(metadata))}"
         if extract_facts:
             url += "&extract_facts=true"
+        acl_param = _acl_readers_param(acl_readers)
+        if acl_param is not None:
+            url += f"&acl_readers={quote(acl_param)}"
         if self._partition:
             url += f"&partition={quote(self._partition)}"
         resp = self._request_with_retry("POST", url, content=text.encode("utf-8"))
         self._raise_for_status(resp)
         body = resp.json()
         return self._parse_document_record(body)
+
+    def remember_media(
+        self,
+        media: bytes,
+        *,
+        modality: str,
+        content_type: str,
+        entity_id: str,
+        filename: str | None = None,
+        caption: str | None = None,
+        transcript: str | None = None,
+        tags: list[str] | None = None,
+        metadata: Metadata | None = None,
+        source: str | None = None,
+        readers: list[str] | None = None,
+    ) -> MediaMemoryRecord:
+        """Store an image/audio memory and index its caption/transcript.
+
+        ``media`` is always sent as base64 JSON to ``POST /v1/memory/media``.
+        Provider URLs are configured on the server; this method never forwards
+        a caller-supplied URL. Use :class:`Memory` for path, URL and PIL input
+        normalization.
+        """
+        modality = modality.strip().lower()
+        if modality not in ("image", "audio"):
+            raise ValueError("modality must be 'image' or 'audio'")
+        if not isinstance(media, bytes) or not media:
+            raise ValueError("media must be non-empty bytes")
+        if not content_type or not content_type.strip():
+            raise ValueError("content_type cannot be empty")
+        if not entity_id or not entity_id.strip():
+            raise ValueError("entity_id cannot be empty")
+        if modality == "image" and transcript is not None:
+            raise ValueError("transcript is valid only for audio memories")
+        if modality == "audio" and caption is not None:
+            raise ValueError("caption is valid only for image memories")
+
+        url = f"/memory/media?entity_id={quote(entity_id)}"
+        if self._partition:
+            url += f"&partition={quote(self._partition)}"
+        if readers is not None:
+            url += f"&readers={quote(','.join(readers))}"
+        body: dict[str, Any] = {
+            "modality": modality,
+            "data_base64": base64.b64encode(media).decode("ascii"),
+            "content_type": content_type,
+            "tags": tags or [],
+        }
+        if filename:
+            body["filename"] = filename
+        if caption is not None:
+            body["caption"] = caption
+        if transcript is not None:
+            body["transcript"] = transcript
+        if metadata is not None:
+            body["metadata"] = metadata
+        if source:
+            body["source"] = source
+        resp = self._request_with_retry("POST", url, json=body)
+        self._raise_for_status(resp)
+        return self._parse_media_memory_record(resp.json())
+
+    # ── Conversational threads ───────────────────────────────────────
+
+    def append_thread(
+        self,
+        thread_id: str,
+        text: str,
+        *,
+        metadata: Metadata | None = None,
+        tags: list[str] | None = None,
+        entity_id: str | None = None,
+        source: str | None = None,
+        acl_readers: list[str] | None = None,
+        filename: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> DocumentRecord:
+        """Append a retry-safe turn to a canonical shared conversation.
+
+        The server assigns ``turn_index``; do not calculate it locally. When
+        *idempotency_key* is omitted the normal POST retry transport mints one
+        stable key for this logical call. Supply one to safely resume the same
+        append across an application restart.
+        """
+        _validate_thread_id(thread_id)
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text cannot be empty")
+        body: dict[str, Any] = {"text": text}
+        if metadata is not None:
+            body["metadata"] = metadata
+        if tags is not None:
+            body["tags"] = tags
+        if entity_id:
+            body["entity_id"] = entity_id
+        if source:
+            body["source"] = source
+        if acl_readers is not None:
+            body["acl_readers"] = acl_readers
+        if filename:
+            body["filename"] = filename
+        url = f"/threads/{quote(thread_id, safe='')}/append"
+        if self._partition:
+            url += f"?partition={quote(self._partition)}"
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        resp = self._request_with_retry("POST", url, json=body, headers=headers)
+        self._raise_for_status(resp)
+        return self._parse_document_record(resp.json())
+
+    def get_thread(
+        self,
+        thread_id: str,
+        *,
+        last_n_turns: int | None = None,
+        recent_first: bool = False,
+    ) -> ConversationThread:
+        """Read a canonical conversation in `turn_index` order.
+
+        A partition handle injects its hard partition boundary automatically.
+        """
+        _validate_thread_id(thread_id)
+        _validate_thread_read_window(last_n_turns)
+        params: dict[str, Any] = {}
+        if last_n_turns is not None:
+            params["last_n_turns"] = last_n_turns
+        if recent_first:
+            params["recent_first"] = "true"
+        if self._partition:
+            params["partition"] = self._partition
+        resp = self._request_with_retry(
+            "GET", f"/threads/{quote(thread_id, safe='')}", params=params
+        )
+        self._raise_for_status(resp)
+        payload = resp.json()
+        return ConversationThread(
+            thread_id=payload.get("thread_id", thread_id),
+            documents=[
+                self._parse_document_record(document)
+                for document in payload.get("documents", [])
+            ],
+        )
 
     def insert_stream(
         self,
@@ -577,6 +1031,7 @@ class AetherClient:
         entity_id: str | None = None,
         source: str | None = None,
         metadata: Metadata | None = None,
+        acl_readers: list[str] | None = None,
     ) -> DocumentRecord:
         """Insert a document from a file-like object or iterator without loading everything into memory.
 
@@ -588,6 +1043,8 @@ class AetherClient:
 
         Pass *source* to tag the document with its origin (e.g. a system or
         channel name) for later filtering on search and list.
+
+        Pass *acl_readers* to set the document's read-ACL — see :meth:`insert`.
 
         Note: streaming uploads bypass the retry wrapper because the stream
         may not be re-readable. Ensure the stream is seekable if you need retries.
@@ -609,10 +1066,13 @@ class AetherClient:
             url += f"&source={quote(source)}"
         if metadata is not None:
             url += f"&metadata={quote(_json_query_value(metadata))}"
+        acl_param = _acl_readers_param(acl_readers)
+        if acl_param is not None:
+            url += f"&acl_readers={quote(acl_param)}"
         if self._partition:
             url += f"&partition={quote(self._partition)}"
         resp = self._client.post(
-            _versioned_path(url),
+            _versioned_path(self._with_principal(url)),
             content=stream,
             headers={"Idempotency-Key": new_idempotency_key()},
         )
@@ -631,12 +1091,17 @@ class AetherClient:
         entity_id: str | None = None,
         source: str | None = None,
         metadata: Metadata | None = None,
+        acl_readers: list[str] | None = None,
     ) -> DocumentRecord:
         """Update an existing document.
 
         *entity_id* replaces the stored entity id; omitting it clears any
         existing value (mirrors *tags* semantics). *source* behaves the same
         way — it replaces the stored origin, and omitting it clears it.
+        *acl_readers* also replaces the stored read-ACL: omitting it clears
+        the ACL (the document becomes unlabeled / tenant-visible), while an
+        explicit empty list quarantines the document to admin-role keys — see
+        :meth:`insert` for the label format.
         """
         if not doc_id:
             raise ValueError("doc_id cannot be empty")
@@ -661,6 +1126,9 @@ class AetherClient:
             url += f"&source={quote(source)}"
         if metadata is not None:
             url += f"&metadata={quote(_json_query_value(metadata))}"
+        acl_param = _acl_readers_param(acl_readers)
+        if acl_param is not None:
+            url += f"&acl_readers={quote(acl_param)}"
         if self._partition:
             url += f"&partition={quote(self._partition)}"
 
@@ -696,6 +1164,54 @@ class AetherClient:
         body = resp.json()
         return [self._parse_audit_record(r) for r in body.get("records", [])]
 
+    def create_grounding_receipt(
+        self,
+        answer: str,
+        source_doc_ids: list[str],
+        *,
+        share: bool = False,
+    ) -> GroundingReceipt:
+        """Return integrity provenance for an answer's declared grounding set.
+
+        Aether hashes ``answer`` in-process and returns its digest; it does not
+        retain the answer. Each source must be live and readable by this API
+        key. ``trust.status == "verified"`` proves retained source-integrity
+        evidence, not factual correctness or an external model's reasoning.
+
+        Set ``share=True`` to opt into a durable, revocable public-safe receipt
+        and SVG badge. The public links contain aggregate proof only; source
+        details remain on this authenticated response. Because share issuance
+        mints a new bearer capability, that opt-in call is deliberately not
+        retried automatically after an ambiguous transport failure.
+        """
+        if not isinstance(answer, str) or not answer.strip():
+            raise ValueError("answer must not be empty")
+        if not source_doc_ids:
+            raise ValueError("source_doc_ids must not be empty")
+        body: dict[str, Any] = {"answer": answer, "source_doc_ids": source_doc_ids}
+        if self._partition:
+            body["partition"] = self._partition
+        if share:
+            body["share"] = True
+        resp = self._request_with_retry(
+            "POST", "/audit/grounding", json=body, retry=not share
+        )
+        self._raise_for_status(resp)
+        return self._parse_grounding_receipt(resp.json())
+
+    def revoke_grounding_receipt(self, receipt_id: str) -> None:
+        """Revoke a receipt the calling tenant owns.
+
+        After a successful return, both its public share URL and SVG badge return
+        404. Unknown and cross-tenant receipt IDs deliberately also return 404.
+        """
+        if not receipt_id:
+            raise ValueError("receipt_id cannot be empty")
+        resp = self._request_with_retry(
+            "DELETE", _with_partition_guard(f"/audit/receipts/{quote(receipt_id, safe='')}", self._partition)
+        )
+        self._raise_for_status(resp)
+
     def download(self, doc_id: str, output_path: str | Path) -> int:
         """Download a document to a file. Returns bytes written."""
         if not doc_id:
@@ -724,6 +1240,7 @@ class AetherClient:
         k: int = 5,
         tags: list[str] | None = None,
         entity_id: str | None = None,
+        thread_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
         last_n_days: int | None = None,
@@ -758,6 +1275,7 @@ class AetherClient:
             include_content=True,
             tags=tags,
             entity_id=entity_id,
+            thread_id=thread_id,
             since=since,
             until=until,
             last_n_days=last_n_days,
@@ -781,7 +1299,21 @@ class AetherClient:
 
         retrieval_results = []
         for r in seen.values():
-            content = r.content if r.content is not None else self.download_text(r.doc_id)
+            # Media downloads are the original binary asset, not text. The
+            # matched passage is the indexed caption/transcript and is therefore
+            # the correct Memory/RAG content for a media hit.
+            if r.modality:
+                if r.passage is not None:
+                    content = r.passage
+                else:
+                    record = self.get(r.doc_id)
+                    if record.derived_text is None:
+                        raise AetherError(
+                            f"media result {r.doc_id} has no derived_text"
+                        )
+                    content = record.derived_text
+            else:
+                content = r.content if r.content is not None else self.download_text(r.doc_id)
             retrieval_results.append(
                 RetrievalResult(
                     doc_id=r.doc_id,
@@ -791,12 +1323,15 @@ class AetherClient:
                     content_type=r.content_type,
                     passage=r.passage,
                     entity_id=r.entity_id,
+                    thread_id=r.thread_id,
+                    turn_index=r.turn_index,
                     tags=r.tags,
                     source=r.source,
                     partition=r.partition,
                     metadata=r.metadata,
                     created_at=r.created_at,
                     updated_at=r.updated_at,
+                    modality=r.modality,
                 )
             )
         return retrieval_results
@@ -965,6 +1500,14 @@ class AetherClient:
         :meth:`query` filters, sorts, and aggregates over."""
         return SchemaClient(self)
 
+    @property
+    def audit(self) -> AuditClient:
+        """Access-audit facade — query the tenant's access-audit log (reads,
+        search deliveries, denials, and admin bypasses) via
+        :meth:`AuditClient.access`. Complements :meth:`lineage`, which returns
+        the signed per-document provenance trail in the same record shape."""
+        return AuditClient(self)
+
     def delete(self, doc_id: str, hard: bool = False) -> None:
         """Delete a document.
 
@@ -1080,6 +1623,7 @@ class AetherClient:
         include_content: bool = False,
         tags: list[str] | None = None,
         entity_id: str | None = None,
+        thread_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
         last_n_days: int | None = None,
@@ -1137,6 +1681,9 @@ class AetherClient:
             params["tags"] = ",".join(tags)
         if entity_id:
             params["entity_id"] = entity_id
+        if thread_id:
+            _validate_thread_id(thread_id)
+            params["thread_id"] = thread_id
         if since:
             params["since"] = since
         if until:
@@ -1187,12 +1734,15 @@ class AetherClient:
             content=r.get("content"),
             passage=r.get("passage"),
             entity_id=r.get("entity_id"),
+            thread_id=r.get("thread_id"),
+            turn_index=r.get("turn_index"),
             tags=list(r.get("tags") or []),
             source=r.get("source"),
             partition=r.get("partition"),
             metadata=dict(r.get("metadata") or {}),
             created_at=r.get("created_at"),
             updated_at=r.get("updated_at"),
+            modality=r.get("modality"),
             query_id=query_id,
         )
 
@@ -1236,6 +1786,7 @@ class AetherClient:
         include_content: bool = False,
         tags: list[str] | None = None,
         entity_id: str | None = None,
+        thread_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
         last_n_days: int | None = None,
@@ -1261,6 +1812,9 @@ class AetherClient:
             params["tags"] = ",".join(tags)
         if entity_id:
             params["entity_id"] = entity_id
+        if thread_id:
+            _validate_thread_id(thread_id)
+            params["thread_id"] = thread_id
         if since:
             params["since"] = since
         if until:
@@ -1366,6 +1920,7 @@ class AetherClient:
         entity_id: str | None = None,
         source: str | None = None,
         metadata: Metadata | None = None,
+        acl_readers: list[str] | None = None,
     ) -> DocumentRecord:
         """Insert a document with caller-provided embeddings.
 
@@ -1377,6 +1932,10 @@ class AetherClient:
 
         Pass *source* to tag the document with its origin (e.g. a system or
         channel name) for later filtering on search and list.
+
+        Pass *acl_readers* to set the document's read-ACL — see :meth:`insert`
+        (this route sends it as a JSON array in the body rather than a query
+        param; the semantics are identical).
         """
         if not content:
             raise ValueError("content cannot be empty")
@@ -1396,6 +1955,8 @@ class AetherClient:
             body["source"] = source
         if metadata is not None:
             body["metadata"] = metadata
+        if acl_readers is not None:
+            body["acl_readers"] = _validate_acl_readers(acl_readers)
         if self._partition:
             body["partition"] = self._partition
 
@@ -1503,6 +2064,7 @@ class AetherClient:
         entity_id: str | None = None,
         source: str | None = None,
         metadata: Metadata | None = None,
+        acl_readers: list[str] | None = None,
     ) -> dict:
         """Enqueue a document for asynchronous processing.
         Returns a dict with: job_id, status, poll_url.
@@ -1512,6 +2074,8 @@ class AetherClient:
 
         Pass *source* to tag the document with its origin (e.g. a system or
         channel name) for later filtering on search and list.
+
+        Pass *acl_readers* to set the document's read-ACL — see :meth:`insert`.
         """
         path = Path(file_path)
         data = path.read_bytes()
@@ -1532,6 +2096,9 @@ class AetherClient:
             url += f"&source={quote(source)}"
         if metadata is not None:
             url += f"&metadata={quote(_json_query_value(metadata))}"
+        acl_param = _acl_readers_param(acl_readers)
+        if acl_param is not None:
+            url += f"&acl_readers={quote(acl_param)}"
         if self._partition:
             url += f"&partition={quote(self._partition)}"
 
@@ -1562,7 +2129,12 @@ class AetherClient:
         chunk_size: int | None = None,
         overlap: int | None = None,
     ) -> list[DocumentRecord]:
-        """Insert multiple text documents in a single batch request."""
+        """Insert multiple text documents in a single batch request.
+
+        Each item may carry its own ``acl_readers`` read-ACL, with the same
+        semantics as :meth:`insert` (omitted -> unlabeled; empty list ->
+        admin-only quarantine).
+        """
         if not documents:
             raise ValueError("documents cannot be empty")
         payload: dict = {
@@ -1574,6 +2146,11 @@ class AetherClient:
                     **({"entity_id": d.entity_id} if d.entity_id else {}),
                     **({"source": d.source} if d.source else {}),
                     **({"metadata": d.metadata} if d.metadata is not None else {}),
+                    **(
+                        {"acl_readers": _acl_readers_param(d.acl_readers)}
+                        if d.acl_readers is not None
+                        else {}
+                    ),
                     **({"partition": self._partition} if self._partition else {}),
                 }
                 for d in documents
@@ -1607,6 +2184,11 @@ class AetherClient:
                     **({"tags": ",".join(q.tags)} if q.tags else {}),
                     **({"include_content": q.include_content} if q.include_content else {}),
                     **({"entity_id": q.entity_id} if q.entity_id else {}),
+                    **(
+                        {"thread_id": _validate_thread_id(q.thread_id)}
+                        if q.thread_id is not None
+                        else {}
+                    ),
                     **({"since": q.since} if q.since else {}),
                     **({"until": q.until} if q.until else {}),
                     **({"last_n_days": q.last_n_days} if q.last_n_days is not None else {}),
