@@ -15,19 +15,29 @@ See ``docs/MEMORY_CONTRACT.md`` for the authoritative cross-SDK definition.
 from __future__ import annotations
 
 import asyncio
+import io
+import mimetypes
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Optional, Union
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 from .async_client import AsyncAetherClient
-from .client import AetherClient
+from .client import AetherClient, _validate_thread_id
+from .errors import AetherError
 from .models import Metadata, MetadataFilter
 
 # Algorithm constants — see MEMORY_CONTRACT.md §4 Mode B. Identical across all
 # four SDKs so the contract test produces the same ordering everywhere.
 OVERFETCH = 4
 MAX_CANDIDATES = 100
+DEFAULT_THREAD_TURNS = 10
+THREAD_SEMANTIC_MATCHES = 5
+MAX_THREAD_TURNS = 1_000
+THREAD_DOWNLOAD_CONCURRENCY = 8
+THREAD_CONTEXT_MAX_BYTES = 16 * 1024 * 1024
 
 # entity_id constraint mirrors the server: 1–256 chars.
 _MAX_ENTITY_ID_LEN = 256
@@ -59,6 +69,8 @@ class MemoryItem:
     entity_id: Optional[str] = None
     metadata: Metadata = field(default_factory=dict)
     score: Optional[float] = None
+    #: ``image`` or ``audio`` for multimodal memories; ``None`` for text.
+    modality: Optional[str] = None
 
 
 # ── Memory graph result types (Part II, ADR-019) ──────────────────────────
@@ -409,6 +421,105 @@ def _normalize_text(text: str) -> str:
     return text
 
 
+def _sniff_media_type(data: bytes, modality: str) -> Optional[str]:
+    """Small dependency-free MIME sniffer for SDK input normalization.
+
+    The server performs the authoritative allow-list + magic check; this helper
+    only lets byte inputs omit an otherwise redundant ``content_type``.
+    """
+    if modality == "image":
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            return "image/webp"
+    else:
+        if data.startswith(b"RIFF") and data[8:12] == b"WAVE":
+            return "audio/wav"
+        if data.startswith((b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")):
+            return "audio/mpeg"
+        if data.startswith(b"OggS"):
+            return "audio/ogg"
+        if data.startswith(b"fLaC"):
+            return "audio/flac"
+        if data.startswith(b"\x1aE\xdf\xa3"):
+            return "audio/webm"
+        if len(data) >= 12 and data[4:8] == b"ftyp":
+            return "audio/mp4"
+    return None
+
+
+def _load_media_input(
+    value: Any,
+    modality: str,
+    *,
+    content_type: Optional[str] = None,
+    filename: Optional[str] = None,
+) -> tuple[bytes, str, Optional[str]]:
+    """Normalize bytes, a local path, a URL, file-like data, or a PIL image.
+
+    URL fetching happens here in the caller process; the Aether server never
+    receives or dereferences the URL. That keeps server-side egress policy and
+    SSRF exposure out of the storage API.
+    """
+    detected_type: Optional[str] = None
+    detected_name = filename
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        data = bytes(value)
+    elif isinstance(value, (str, Path)):
+        raw = str(value)
+        if raw.startswith(("https://", "http://")):
+            request = Request(raw, headers={"User-Agent": "aether-python-sdk"})
+            with urlopen(request, timeout=30) as response:  # nosec B310 — explicit caller URL
+                data = response.read()
+                detected_type = response.headers.get_content_type()
+            detected_name = detected_name or Path(urlparse(raw).path).name or None
+        else:
+            path = Path(value)
+            data = path.read_bytes()
+            detected_name = detected_name or path.name
+            detected_type = mimetypes.guess_type(path.name)[0]
+    elif modality == "image" and callable(getattr(value, "save", None)):
+        # PIL is optional. Duck typing keeps it out of the SDK dependency tree.
+        image_format = (getattr(value, "format", None) or "PNG").upper()
+        buffer = io.BytesIO()
+        value.save(buffer, format=image_format)
+        data = buffer.getvalue()
+        detected_type = {
+            "JPG": "image/jpeg",
+            "JPEG": "image/jpeg",
+            "PNG": "image/png",
+            "WEBP": "image/webp",
+            "GIF": "image/gif",
+        }.get(image_format)
+    elif callable(getattr(value, "read", None)):
+        raw = value.read()
+        if not isinstance(raw, (bytes, bytearray, memoryview)):
+            raise TypeError("media file-like objects must return bytes")
+        data = bytes(raw)
+        detected_name = detected_name or getattr(value, "name", None)
+        if detected_name:
+            detected_type = mimetypes.guess_type(str(detected_name))[0]
+    else:
+        raise TypeError(
+            "media must be bytes, a path/URL, a binary file-like object, "
+            "or a PIL-compatible image"
+        )
+    if not data:
+        raise ValueError("media cannot be empty")
+    resolved_type = (
+        (content_type or "").split(";", 1)[0].strip().lower()
+        or (detected_type or "").split(";", 1)[0].strip().lower()
+        or _sniff_media_type(data, modality)
+    )
+    if not resolved_type:
+        raise ValueError("content_type is required for unrecognized media bytes")
+    return data, resolved_type, detected_name
+
+
 def _clamp_recency_weight(recency_weight: float) -> float:
     """Clamp ``recency_weight`` to ``[0, 1]`` (MEMORY_CONTRACT.md §4)."""
     if recency_weight < 0.0:
@@ -544,6 +655,7 @@ class _MemoryBase:
                 entity_id=self.entity_id,
                 metadata=c.metadata,
                 score=blended,
+                modality=c.modality,
             )
             for blended, c, created in scored[:k]
         ]
@@ -615,13 +727,26 @@ class Memory(_MemoryBase):
     def __exit__(self, *args) -> None:
         self.close()
 
+    def thread(self, thread_id: str) -> "Thread":
+        """Bind an ordered conversation helper to this Memory's entity."""
+        return Thread(self, thread_id)
+
     # ── Operations ────────────────────────────────────────────────────
 
     def remember(
         self,
-        text: str,
+        text: Optional[str] = None,
         metadata: Optional[Metadata] = None,
         extract: Optional[bool] = None,
+        *,
+        image: Any = None,
+        audio: Any = None,
+        caption: Optional[str] = None,
+        transcript: Optional[str] = None,
+        transcribe: bool = True,
+        content_type: Optional[str] = None,
+        filename: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> MemoryItem:
         """Store one memory for the entity (**one HTTP call**).
 
@@ -638,6 +763,48 @@ class Memory(_MemoryBase):
         facts with ``kind="fact"`` on the underlying client. Requires fact
         extraction to be configured on the node.
         """
+        supplied = sum(value is not None for value in (text, image, audio))
+        if supplied != 1:
+            raise ValueError("provide exactly one of text, image, or audio")
+        if image is not None or audio is not None:
+            if extract is not None:
+                raise ValueError("extract is valid only for text memories")
+            modality = "image" if image is not None else "audio"
+            if modality == "audio" and not transcribe and transcript is None:
+                raise ValueError("transcribe=False requires an explicit transcript")
+            if modality == "image" and transcript is not None:
+                raise ValueError("transcript is valid only for audio memories")
+            if modality == "audio" and caption is not None:
+                raise ValueError("caption is valid only for image memories")
+            data, resolved_type, resolved_name = _load_media_input(
+                image if image is not None else audio,
+                modality,
+                content_type=content_type,
+                filename=filename,
+            )
+            tags = _encode_legacy_metadata_tags(metadata)
+            record = self.client.remember_media(
+                data,
+                modality=modality,
+                content_type=resolved_type,
+                entity_id=self.entity_id,
+                filename=resolved_name,
+                caption=caption,
+                transcript=transcript,
+                tags=tags,
+                metadata=metadata,
+                source=source,
+            )
+            return MemoryItem(
+                id=record.doc_id,
+                text=record.derived_text,
+                created_at=record.created_at,
+                entity_id=record.entity_id or self.entity_id,
+                metadata=record.metadata or metadata or {},
+                score=None,
+                modality=record.modality,
+            )
+
         text = _normalize_text(text)
         tags = _encode_legacy_metadata_tags(metadata)
         record = self.client.insert_text(
@@ -654,6 +821,7 @@ class Memory(_MemoryBase):
             entity_id=record.entity_id or self.entity_id,
             metadata=record.metadata or metadata or {},
             score=None,
+            modality=None,
         )
 
     def recall(
@@ -696,6 +864,7 @@ class Memory(_MemoryBase):
                     entity_id=self.entity_id,
                     metadata=h.metadata,
                     score=_similarity(h.score),
+                    modality=h.modality,
                 )
                 for h in hits
             ]
@@ -741,7 +910,11 @@ class Memory(_MemoryBase):
         )
         items: list[MemoryItem] = []
         for r in records[:limit]:
-            text = self.client.download_text(r.doc_id)
+            text = (
+                r.derived_text
+                if r.modality and r.derived_text is not None
+                else self.client.download_text(r.doc_id)
+            )
             items.append(
                 MemoryItem(
                     id=r.doc_id,
@@ -750,6 +923,7 @@ class Memory(_MemoryBase):
                     entity_id=r.entity_id or self.entity_id,
                     metadata=r.metadata,
                     score=None,
+                    modality=r.modality,
                 )
             )
         return items
@@ -1009,18 +1183,74 @@ class AsyncMemory(_MemoryBase):
     async def __aexit__(self, *args) -> None:
         await self.close()
 
+    def thread(self, thread_id: str) -> "AsyncThread":
+        """Bind an async ordered conversation helper to this Memory's entity."""
+        return AsyncThread(self, thread_id)
+
     # ── Operations ────────────────────────────────────────────────────
 
     async def remember(
         self,
-        text: str,
+        text: Optional[str] = None,
         metadata: Optional[Metadata] = None,
         extract: Optional[bool] = None,
+        *,
+        image: Any = None,
+        audio: Any = None,
+        caption: Optional[str] = None,
+        transcript: Optional[str] = None,
+        transcribe: bool = True,
+        content_type: Optional[str] = None,
+        filename: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> MemoryItem:
         """Store one memory for the entity (**one HTTP call**). See
         :meth:`Memory.remember`. Pass ``extract=True`` to also distill atomic
         facts server-side; when omitted, the constructor's
         ``extract_facts`` flag decides."""
+        supplied = sum(value is not None for value in (text, image, audio))
+        if supplied != 1:
+            raise ValueError("provide exactly one of text, image, or audio")
+        if image is not None or audio is not None:
+            if extract is not None:
+                raise ValueError("extract is valid only for text memories")
+            modality = "image" if image is not None else "audio"
+            if modality == "audio" and not transcribe and transcript is None:
+                raise ValueError("transcribe=False requires an explicit transcript")
+            if modality == "image" and transcript is not None:
+                raise ValueError("transcript is valid only for audio memories")
+            if modality == "audio" and caption is not None:
+                raise ValueError("caption is valid only for image memories")
+            data, resolved_type, resolved_name = await asyncio.to_thread(
+                _load_media_input,
+                image if image is not None else audio,
+                modality,
+                content_type=content_type,
+                filename=filename,
+            )
+            tags = _encode_legacy_metadata_tags(metadata)
+            record = await self.client.remember_media(
+                data,
+                modality=modality,
+                content_type=resolved_type,
+                entity_id=self.entity_id,
+                filename=resolved_name,
+                caption=caption,
+                transcript=transcript,
+                tags=tags,
+                metadata=metadata,
+                source=source,
+            )
+            return MemoryItem(
+                id=record.doc_id,
+                text=record.derived_text,
+                created_at=record.created_at,
+                entity_id=record.entity_id or self.entity_id,
+                metadata=record.metadata or metadata or {},
+                score=None,
+                modality=record.modality,
+            )
+
         text = _normalize_text(text)
         tags = _encode_legacy_metadata_tags(metadata)
         record = await self.client.insert_text(
@@ -1037,6 +1267,7 @@ class AsyncMemory(_MemoryBase):
             entity_id=record.entity_id or self.entity_id,
             metadata=record.metadata or metadata or {},
             score=None,
+            modality=None,
         )
 
     async def recall(
@@ -1076,6 +1307,7 @@ class AsyncMemory(_MemoryBase):
                     entity_id=self.entity_id,
                     metadata=h.metadata,
                     score=_similarity(h.score),
+                    modality=h.modality,
                 )
                 for h in hits
             ]
@@ -1121,9 +1353,12 @@ class AsyncMemory(_MemoryBase):
         records = records[:limit]
         if not records:
             return []
-        texts = await asyncio.gather(
-            *(self.client.download_text(r.doc_id) for r in records)
-        )
+        async def content_for(record):
+            if record.modality and record.derived_text is not None:
+                return record.derived_text
+            return await self.client.download_text(record.doc_id)
+
+        texts = await asyncio.gather(*(content_for(r) for r in records))
         return [
             MemoryItem(
                 id=r.doc_id,
@@ -1132,6 +1367,7 @@ class AsyncMemory(_MemoryBase):
                 entity_id=r.entity_id or self.entity_id,
                 metadata=r.metadata,
                 score=None,
+                modality=r.modality,
             )
             for r, text in zip(records, texts)
         ]
@@ -1315,3 +1551,209 @@ class AsyncMemory(_MemoryBase):
         """See :meth:`Memory.consolidate`."""
         method, path, params, body, parse = _spec_consolidate()
         return parse(await self._graph_request(method, path, params, body))
+
+
+def _validate_thread_context(query: str, last_n_turns: int) -> None:
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query cannot be empty")
+    if (
+        isinstance(last_n_turns, bool)
+        or not isinstance(last_n_turns, int)
+        or not 1 <= last_n_turns <= MAX_THREAD_TURNS
+    ):
+        raise ValueError(f"last_n_turns must be between 1 and {MAX_THREAD_TURNS}")
+
+
+def _add_thread_context_bytes(total: int, text: str) -> int:
+    total += len(text.encode("utf-8"))
+    if total > THREAD_CONTEXT_MAX_BYTES:
+        raise AetherError(
+            f"thread context exceeds the {THREAD_CONTEXT_MAX_BYTES}-byte safety limit"
+        )
+    return total
+
+
+class Thread:
+    """Entity-scoped ordered conversation composed over :class:`Memory`.
+
+    Construct directly as ``Thread(memory, thread_id)`` or with
+    ``memory.thread(thread_id)``.
+    """
+
+    def __init__(self, memory: Memory, thread_id: str) -> None:
+        if not isinstance(memory, Memory):
+            raise TypeError("memory must be a Memory")
+        self.memory = memory
+        self.thread_id = _validate_thread_id(thread_id)
+
+    def append(self, text: str, metadata: Optional[Metadata] = None) -> MemoryItem:
+        """Append one turn, automatically scoped to the Memory's entity."""
+        text = _normalize_text(text)
+        record = self.memory.client.append_thread(
+            self.thread_id,
+            text,
+            metadata=metadata,
+            entity_id=self.memory.entity_id,
+        )
+        return MemoryItem(
+            id=record.doc_id,
+            text=text,
+            created_at=record.created_at,
+            entity_id=record.entity_id or self.memory.entity_id,
+            metadata=record.metadata or metadata or {},
+        )
+
+    def context(
+        self,
+        query: str,
+        last_n_turns: int = DEFAULT_THREAD_TURNS,
+        recent_first: bool = False,
+    ) -> list[MemoryItem]:
+        """Return bounded recent turns plus thread-scoped semantic matches.
+
+        Recent turns come first (chronological unless ``recent_first``), then
+        up to five relevance-ordered matches not already in that window.
+        Document ids are de-duplicated and the default ten-turn window prevents
+        an unbounded transcript download. Download fanout is capped at eight
+        and the assembled context has a shared 16 MiB UTF-8 byte budget.
+        """
+        _validate_thread_context(query, last_n_turns)
+        thread = self.memory.client.get_thread(
+            self.thread_id,
+            last_n_turns=last_n_turns,
+            recent_first=recent_first,
+        )
+        matches = self.memory.client.retrieve(
+            query,
+            k=THREAD_SEMANTIC_MATCHES,
+            entity_id=self.memory.entity_id,
+            thread_id=self.thread_id,
+        )
+        records = [
+            record
+            for record in thread.documents
+            if record.entity_id == self.memory.entity_id
+        ]
+        items: list[MemoryItem] = []
+        context_bytes = 0
+        for record in records:
+            text = self.memory.client.download_text(record.doc_id)
+            context_bytes = _add_thread_context_bytes(context_bytes, text)
+            items.append(
+                MemoryItem(
+                    id=record.doc_id,
+                    text=text,
+                    created_at=record.created_at,
+                    entity_id=record.entity_id or self.memory.entity_id,
+                    metadata=record.metadata,
+                )
+            )
+        seen = {item.id for item in items}
+        for match in matches:
+            if match.doc_id in seen:
+                continue
+            seen.add(match.doc_id)
+            context_bytes = _add_thread_context_bytes(context_bytes, match.content)
+            items.append(
+                MemoryItem(
+                    id=match.doc_id,
+                    text=match.content,
+                    entity_id=self.memory.entity_id,
+                    metadata=match.metadata,
+                    score=_similarity(match.score),
+                )
+            )
+        return items
+
+
+class AsyncThread:
+    """Async counterpart to :class:`Thread`, composed over AsyncMemory."""
+
+    def __init__(self, memory: AsyncMemory, thread_id: str) -> None:
+        if not isinstance(memory, AsyncMemory):
+            raise TypeError("memory must be an AsyncMemory")
+        self.memory = memory
+        self.thread_id = _validate_thread_id(thread_id)
+
+    async def append(
+        self, text: str, metadata: Optional[Metadata] = None
+    ) -> MemoryItem:
+        """Async mirror of :meth:`Thread.append`."""
+        text = _normalize_text(text)
+        record = await self.memory.client.append_thread(
+            self.thread_id,
+            text,
+            metadata=metadata,
+            entity_id=self.memory.entity_id,
+        )
+        return MemoryItem(
+            id=record.doc_id,
+            text=text,
+            created_at=record.created_at,
+            entity_id=record.entity_id or self.memory.entity_id,
+            metadata=record.metadata or metadata or {},
+        )
+
+    async def context(
+        self,
+        query: str,
+        last_n_turns: int = DEFAULT_THREAD_TURNS,
+        recent_first: bool = False,
+    ) -> list[MemoryItem]:
+        """Async mirror of :meth:`Thread.context`, including its bounded
+        download concurrency and shared 16 MiB context budget."""
+        _validate_thread_context(query, last_n_turns)
+        thread, matches = await asyncio.gather(
+            self.memory.client.get_thread(
+                self.thread_id,
+                last_n_turns=last_n_turns,
+                recent_first=recent_first,
+            ),
+            self.memory.client.retrieve(
+                query,
+                k=THREAD_SEMANTIC_MATCHES,
+                entity_id=self.memory.entity_id,
+                thread_id=self.thread_id,
+            ),
+        )
+        records = [
+            record
+            for record in thread.documents
+            if record.entity_id == self.memory.entity_id
+        ]
+        texts: list[str] = []
+        context_bytes = 0
+        for offset in range(0, len(records), THREAD_DOWNLOAD_CONCURRENCY):
+            batch = records[offset : offset + THREAD_DOWNLOAD_CONCURRENCY]
+            downloaded = await asyncio.gather(
+                *(self.memory.client.download_text(record.doc_id) for record in batch)
+            )
+            for text in downloaded:
+                context_bytes = _add_thread_context_bytes(context_bytes, text)
+            texts.extend(downloaded)
+        items = [
+            MemoryItem(
+                id=record.doc_id,
+                text=text,
+                created_at=record.created_at,
+                entity_id=record.entity_id or self.memory.entity_id,
+                metadata=record.metadata,
+            )
+            for record, text in zip(records, texts)
+        ]
+        seen = {item.id for item in items}
+        for match in matches:
+            if match.doc_id in seen:
+                continue
+            seen.add(match.doc_id)
+            context_bytes = _add_thread_context_bytes(context_bytes, match.content)
+            items.append(
+                MemoryItem(
+                    id=match.doc_id,
+                    text=match.content,
+                    entity_id=self.memory.entity_id,
+                    metadata=match.metadata,
+                    score=_similarity(match.score),
+                )
+            )
+        return items

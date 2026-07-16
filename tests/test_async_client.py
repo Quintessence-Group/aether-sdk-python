@@ -5,8 +5,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from aether import AsyncAetherClient, BatchSearchQuery, EntityBackfillReport, RetrievalResult
-from aether.errors import CreditExhaustedError, TenantPausedError
+from aether import (
+    AsyncAetherClient,
+    BatchSearchQuery,
+    EntityBackfillReport,
+    GroundingReceipt,
+    RetrievalResult,
+)
+from aether.errors import AetherApiError, CreditExhaustedError, TenantPausedError
 
 
 @pytest.fixture
@@ -19,6 +25,12 @@ def make_async_response(json_data=None, content=None, status_code=200):
     resp = MagicMock()
     resp.status_code = status_code
     resp.is_success = 200 <= status_code < 300
+    resp.headers = {}
+    resp.reason_phrase = (
+        "OK" if status_code == 200
+        else "Bad Gateway" if status_code == 502
+        else "Service Unavailable"
+    )
     resp.raise_for_status = MagicMock()
     if json_data is not None:
         resp.json.return_value = json_data
@@ -35,6 +47,173 @@ async def test_download_text(client):
         result = await client.download_text("doc-123")
 
     assert result == "Hello async world!"
+
+
+@pytest.mark.asyncio
+async def test_async_grounding_receipt_posts_private_inputs_and_parses_public_safe_receipt(client):
+    response = make_async_response(json_data={
+        "answer_digest": "blake3:answer-commitment",
+        "sources": [{
+            "document_id": "doc-1",
+            "content_id": "aether:private-cid",
+            "rank": 0,
+            "retained_signed_event_count": 1,
+            "current_content_verified": True,
+            "proof": {
+                "content_id": "aether:private-cid",
+                "lamport": 42,
+                "node_id": "source-node-id",
+                "public_key": "source-public-key",
+                "signature": "source-signature",
+                "verified": True,
+            },
+        }],
+        "trust": {
+            "status": "verified",
+            "sources_requested": 1,
+            "sources_verified": 1,
+            "answer_bound": True,
+        },
+        "binding": {
+            "algorithm": "blake3-keyed/aether-grounding-binding/v1",
+            "source_set_commitment": "blake3:sources",
+            "source_evidence_commitment": "blake3:evidence",
+            "binding_commitment": "opaque-binding",
+            "verification_salt": "authenticated-only-salt",
+        },
+        "attestation": {
+            "version": "aether-grounding-set-attestation/v1",
+            "issued_at": "2026-07-10T00:00:00Z",
+            "binding_algorithm": "blake3-keyed/aether-grounding-binding/v1",
+            "signer_node_id": "grounding-node-id",
+            "signer_public_key": "grounding-public-key",
+            "signature": "grounding-signature",
+            "verified": True,
+        },
+        "receipt": {
+            "version": "aether-grounding-receipt/v2",
+            "receipt_id": "receipt-1",
+            "issued_at": "2026-07-10T00:00:00Z",
+            "expires_at": "2026-08-09T00:00:00Z",
+            "source_count": 1,
+            "verified_source_count": 1,
+            "status": "verified",
+            "binding_commitment": "opaque-binding",
+            "capability_commitment": "blake3:capability",
+            "owner_commitment": "blake3:owner",
+            "attestation": {
+                "signer_node_id": "node-id",
+                "signer_public_key": "public-key",
+                "signature": "signature",
+                "verified": True,
+            },
+            "share_url": "/receipts/capability",
+            "badge_url": "/receipts/capability/badge.svg",
+        },
+    })
+    with patch.object(
+        client._client, "request", new_callable=AsyncMock, return_value=response
+    ) as mock_req:
+        result = await client.create_grounding_receipt("private answer", ["doc-1"], share=True)
+
+    assert isinstance(result, GroundingReceipt)
+    assert result.sources[0].proof is not None
+    assert result.sources[0].proof.lamport == 42
+    assert result.binding.source_evidence_commitment == "blake3:evidence"
+    assert result.attestation.signature == "grounding-signature"
+    assert result.receipt is not None
+    assert result.receipt.capability_commitment == "blake3:capability"
+    assert result.receipt.owner_commitment == "blake3:owner"
+    assert result.receipt.badge_url == "/receipts/capability/badge.svg"
+    assert mock_req.call_args.args[:2] == ("POST", "/v1/audit/grounding")
+    assert mock_req.call_args.kwargs["json"] == {
+        "answer": "private answer", "source_doc_ids": ["doc-1"], "share": True
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [502, 503])
+async def test_async_shareable_receipt_does_not_retry_transient_response(status_code):
+    retry_client = AsyncAetherClient(
+        base_url="http://localhost:9000", max_retries=2, retry_base_delay=0
+    )
+    first = make_async_response(
+        json_data={"error": f"first-{status_code}"}, status_code=status_code
+    )
+    success = make_async_response(json_data={"answer_digest": "unexpected"})
+    try:
+        with patch.object(
+            retry_client._client,
+            "request",
+            new_callable=AsyncMock,
+            side_effect=[first, success],
+        ) as mock_req:
+            with pytest.raises(AetherApiError) as exc_info:
+                await retry_client.create_grounding_receipt(
+                    "answer", ["doc-1"], share=True
+                )
+    finally:
+        await retry_client.close()
+
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.message == f"first-{status_code}"
+    assert mock_req.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [502, 503])
+async def test_async_private_receipt_retains_transient_retry(status_code):
+    retry_client = AsyncAetherClient(
+        base_url="http://localhost:9000", max_retries=2, retry_base_delay=0
+    )
+    first = make_async_response(
+        json_data={"error": f"transient-{status_code}"}, status_code=status_code
+    )
+    success = make_async_response(json_data={"answer_digest": "blake3:retried"})
+    try:
+        with patch.object(
+            retry_client._client,
+            "request",
+            new_callable=AsyncMock,
+            side_effect=[first, success],
+        ) as mock_req:
+            result = await retry_client.create_grounding_receipt(
+                "answer", ["doc-1"]
+            )
+    finally:
+        await retry_client.close()
+
+    assert result.answer_digest == "blake3:retried"
+    assert mock_req.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_async_revoke_grounding_receipt_uses_void_delete(client):
+    response = make_async_response()
+    with patch.object(
+        client._client, "request", new_callable=AsyncMock, return_value=response
+    ) as mock_req:
+        await client.revoke_grounding_receipt("receipt-1")
+
+    assert mock_req.call_args.args[:2] == ("DELETE", "/v1/audit/receipts/receipt-1")
+
+
+@pytest.mark.asyncio
+async def test_async_partition_handle_scopes_grounding_create_and_revoke(client):
+    response = make_async_response(json_data={
+        "answer_digest": "blake3:answer", "sources": [],
+        "trust": {"status": "partial", "sources_requested": 0, "sources_verified": 0, "answer_bound": True},
+        "binding": {"algorithm": "blake3-keyed/aether-grounding-binding/v1", "source_set_commitment": "blake3:sources", "binding_commitment": "opaque", "verification_salt": "salt"},
+    })
+    revoke = make_async_response()
+    scoped = client.partition("customer-a")
+    with patch.object(scoped._client, "request", new_callable=AsyncMock, side_effect=[response, revoke]) as mock_req:
+        await scoped.create_grounding_receipt("answer", ["doc-1"])
+        await scoped.revoke_grounding_receipt("receipt-1")
+    assert mock_req.call_args_list[0].kwargs["json"]["partition"] == "customer-a"
+    assert mock_req.call_args_list[1].args[:2] == (
+        "DELETE", "/v1/audit/receipts/receipt-1?partition=customer-a"
+    )
 
 
 @pytest.mark.asyncio
@@ -462,6 +641,7 @@ async def test_batch_search_serializes_filters(client):
                 q="filtered",
                 k=5,
                 entity_id="user-123",
+                thread_id="support-42",
                 since="2026-06-01T00:00:00Z",
                 until="2026-06-10T23:59:59Z",
                 max_distance=0.3,
@@ -472,14 +652,26 @@ async def test_batch_search_serializes_filters(client):
 
     queries = mock_req.call_args[1]["json"]["queries"]
     assert queries[0]["entity_id"] == "user-123"
+    assert queries[0]["thread_id"] == "support-42"
     assert queries[0]["since"] == "2026-06-01T00:00:00Z"
     assert queries[0]["until"] == "2026-06-10T23:59:59Z"
     assert queries[0]["max_distance"] == 0.3
     assert "last_n_days" not in queries[0]
     assert queries[1]["last_n_days"] == 7
     assert "since" not in queries[1]
-    for key in ("entity_id", "since", "until", "last_n_days", "max_distance"):
+    for key in ("entity_id", "thread_id", "since", "until", "last_n_days", "max_distance"):
         assert key not in queries[2]
+
+
+@pytest.mark.asyncio
+async def test_async_batch_search_rejects_invalid_thread_id_before_request(client):
+    with patch.object(client._client, "request", new_callable=AsyncMock) as mock_req:
+        with pytest.raises(ValueError, match="thread_id"):
+            await client.batch_search([
+                BatchSearchQuery(q="test", thread_id="bad\x00thread")
+            ])
+
+    mock_req.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -805,12 +997,13 @@ async def test_async_batch_search_sends_partition_per_query(client):
     resp = make_async_response(json_data={"results": []})
     with patch.object(client._client, "request", new_callable=AsyncMock, return_value=resp) as mock_req:
         await client.partition("tenant-a").batch_search([
-            BatchSearchQuery(q="one"),
-            BatchSearchQuery(q="two"),
+            BatchSearchQuery(q="one", thread_id="thread-one"),
+            BatchSearchQuery(q="two", thread_id="thread-two"),
         ])
 
     queries = mock_req.call_args[1]["json"]["queries"]
     assert [q["partition"] for q in queries] == ["tenant-a", "tenant-a"]
+    assert [q["thread_id"] for q in queries] == ["thread-one", "thread-two"]
 
 
 @pytest.mark.asyncio

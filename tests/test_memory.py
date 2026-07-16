@@ -7,6 +7,8 @@ with the *real* raw client running underneath, constructed via the DI path
 from ``docs/MEMORY_CONTRACT.md`` §8 cases 1–9.
 """
 
+import asyncio
+import base64
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,11 +18,14 @@ import pytest
 from aether import (
     AetherApiError,
     AetherClient,
+    AetherError,
     AsyncAetherClient,
     AsyncMemory,
+    AsyncThread,
     CreditExhaustedError,
     Memory,
     MemoryItem,
+    Thread,
 )
 
 FIXED_NOW = datetime(2026, 6, 15, 0, 0, 0, tzinfo=timezone.utc)
@@ -75,8 +80,13 @@ class Transport:
         return [c for c in self.calls if c[0] == method and c[1] == path]
 
 
-def _sync_memory(transport, entity_id="user-42", **kw):
-    client = AetherClient(base_url="http://localhost:9000", api_key="k", max_retries=0)
+def _sync_memory(transport, entity_id="user-42", max_retries=0, **kw):
+    client = AetherClient(
+        base_url="http://localhost:9000",
+        api_key="k",
+        max_retries=max_retries,
+        retry_base_delay=0,
+    )
     patch.object(client._client, "request", side_effect=transport).start()
     return Memory(entity_id, client=client, now=lambda: FIXED_NOW, **kw)
 
@@ -88,8 +98,13 @@ def _async_transport(transport):
     return _call
 
 
-def _async_memory(transport, entity_id="user-42", **kw):
-    client = AsyncAetherClient(base_url="http://localhost:9000", api_key="k", max_retries=0)
+def _async_memory(transport, entity_id="user-42", max_retries=0, **kw):
+    client = AsyncAetherClient(
+        base_url="http://localhost:9000",
+        api_key="k",
+        max_retries=max_retries,
+        retry_base_delay=0,
+    )
     patch.object(
         client._client, "request", new=AsyncMock(side_effect=_async_transport(transport))
     ).start()
@@ -120,6 +135,21 @@ def _search_resp(results):
 
 def _list_resp(documents):
     return _resp(json_data={"documents": documents, "total": len(documents), "has_more": False})
+
+
+def _media_resp(modality="image", derived_text="A red bicycle."):
+    return _resp(json_data={
+        "doc_id": "media-1",
+        "cid": "cid-media",
+        "modality": modality,
+        "content_type": "image/png" if modality == "image" else "audio/wav",
+        "derived_text": derived_text,
+        "derived_by": "client",
+        "created_at": "2026-06-15T00:00:00Z",
+        "entity_id": "user-42",
+        "partition": None,
+        "metadata": {"aether.media.modality": modality},
+    })
 
 
 # ── §8.1 scoping ─────────────────────────────────────────────────────
@@ -607,6 +637,119 @@ class TestAsyncParity:
         assert t.calls == []  # no HTTP call made
 
 
+class TestMultimodalMemory:
+    MEDIA_URL = "/v1/memory/media?entity_id=user-42"
+
+    def test_image_bytes_use_same_remember_surface(self):
+        t = Transport({("POST", self.MEDIA_URL): _media_resp()})
+        mem = _sync_memory(t)
+        png = b"\x89PNG\r\n\x1a\nsource"
+
+        item = mem.remember(
+            image=png,
+            caption="A red bicycle.",
+            metadata={"album": "commute"},
+        )
+
+        assert item.id == "media-1"
+        assert item.text == "A red bicycle."
+        assert item.modality == "image"
+        _, _, kwargs = t.calls[0]
+        payload = kwargs["json"]
+        assert payload["modality"] == "image"
+        assert payload["content_type"] == "image/png"
+        assert payload["caption"] == "A red bicycle."
+        assert base64.b64decode(payload["data_base64"]) == png
+
+    async def test_async_audio_transcription_request(self):
+        t = Transport({
+            ("POST", self.MEDIA_URL): _media_resp("audio", "Session transcript."),
+        })
+        mem = _async_memory(t)
+        wav = b"RIFF\x00\x00\x00\x00WAVE"
+
+        item = await mem.remember(audio=wav, content_type="audio/wav")
+
+        assert item.modality == "audio"
+        assert item.text == "Session transcript."
+        payload = t.calls[0][2]["json"]
+        assert payload["modality"] == "audio"
+        assert "transcript" not in payload  # server transcribes automatically
+
+    def test_media_recall_uses_indexed_passage_not_binary_download(self):
+        t = Transport({
+            ("GET", "/v1/search"): _search_resp([{
+                "doc_id": "media-1",
+                "score": 96,
+                "content_type": "image/png",
+                "passage": "A red bicycle.",
+                "modality": "image",
+                "metadata": {"album": "commute"},
+            }]),
+        })
+        mem = _sync_memory(t)
+
+        items = mem.recall("bicycle")
+
+        assert len(t.calls) == 1
+        assert items[0].text == "A red bicycle."
+        assert items[0].modality == "image"
+
+    def test_media_recall_missing_passage_uses_metadata_not_binary_download(self):
+        t = Transport({
+            ("GET", "/v1/search"): _search_resp([{
+                "doc_id": "media-1",
+                "score": 96,
+                "content_type": "image/png",
+                "modality": "image",
+            }]),
+            ("GET", "/v1/documents/media-1"): _resp(json_data={
+                "doc_id": "media-1",
+                "cid": "cid-media",
+                "content_type": "image/png",
+                "modality": "image",
+                "derived_text": "A red bicycle.",
+            }),
+        })
+        mem = _sync_memory(t)
+
+        items = mem.recall("bicycle")
+
+        assert [call[1] for call in t.calls] == [
+            "/v1/search",
+            "/v1/documents/media-1",
+        ]
+        assert items[0].text == "A red bicycle."
+
+    def test_media_list_uses_authorized_derived_text(self):
+        docs = [{
+            "doc_id": "media-1",
+            "created_at": "2026-06-15T00:00:00Z",
+            "entity_id": "user-42",
+            "modality": "audio",
+            "derived_text": "Session transcript.",
+        }]
+        t = Transport({("GET", "/v1/documents"): _list_resp(docs)})
+        mem = _sync_memory(t)
+
+        items = mem.list()
+
+        assert len(t.calls) == 1
+        assert items[0].text == "Session transcript."
+        assert items[0].modality == "audio"
+
+    def test_requires_one_input_and_honors_transcribe_false(self):
+        t = Transport({})
+        mem = _sync_memory(t)
+        with pytest.raises(ValueError, match="exactly one"):
+            mem.remember("text", image=b"image")
+        with pytest.raises(ValueError, match="explicit transcript"):
+            mem.remember(audio=b"audio", transcribe=False, content_type="audio/wav")
+        with pytest.raises(ValueError, match="valid only for text"):
+            mem.remember(image=b"image", extract=True, content_type="image/png")
+        assert t.calls == []
+
+
 # ── extract_facts constructor default + per-call override (contract §3) ──
 
 _INSERT_URL_PLAIN = "/v1/documents?filename=text.txt&content_type=text%2Fplain&entity_id=user-42"
@@ -1032,3 +1175,340 @@ class TestGraphAsync:
         mem = _async_memory(t)
         report = await mem.consolidate()
         assert report.retracted == 1
+
+
+# ── entity-scoped Thread helper ─────────────────────────────
+
+
+def _thread_turn(
+    doc_id,
+    turn_index,
+    *,
+    entity_id="user-42",
+    metadata=None,
+    created_at="2026-06-15T00:00:00Z",
+):
+    return {
+        "doc_id": doc_id,
+        "cid": f"blake3:{doc_id}",
+        "content_type": "text/plain",
+        "size_bytes": 5,
+        "chunks": 1,
+        "vectors": 1,
+        "version": 1,
+        "created_at": created_at,
+        "entity_id": entity_id,
+        "thread_id": "care/42",
+        "turn_index": turn_index,
+        "metadata": metadata or {},
+    }
+
+
+def _thread_search_result(doc_id, text, score=80, *, metadata=None):
+    return {
+        "doc_id": doc_id,
+        "score": score,
+        "content_type": "text/plain",
+        "content": text,
+        "entity_id": "user-42",
+        "thread_id": "care/42",
+        "metadata": metadata or {},
+    }
+
+
+class TestThreadHelper:
+    def test_direct_constructor_and_memory_factory_append_entity_and_metadata(self):
+        t = Transport(
+            {
+                ("POST", "/v1/threads/care%2F42/append"): _resp(
+                    json_data=_thread_turn(
+                        "turn-1", 0, metadata={"role": "patient"}
+                    )
+                )
+            }
+        )
+        mem = _sync_memory(t)
+        direct = Thread(mem, "care/42")
+        assert isinstance(mem.thread("care/42"), Thread)
+
+        item = direct.append("I slept better", {"role": "patient"})
+
+        assert item == MemoryItem(
+            id="turn-1",
+            text="I slept better",
+            created_at="2026-06-15T00:00:00Z",
+            entity_id="user-42",
+            metadata={"role": "patient"},
+        )
+        body = t.calls[0][2]["json"]
+        assert body == {
+            "text": "I slept better",
+            "metadata": {"role": "patient"},
+            "entity_id": "user-42",
+        }
+
+    def test_context_recent_then_semantic_filters_entity_and_deduplicates(self):
+        t = Transport(
+            {
+                ("GET", "/v1/threads/care%2F42"): _resp(
+                    json_data={
+                        "thread_id": "care/42",
+                        "documents": [
+                            _thread_turn("recent-1", 3),
+                            _thread_turn("other-owner", 4, entity_id="other-user"),
+                        ],
+                    }
+                ),
+                ("GET", "/v1/search"): _search_resp(
+                    [
+                        _thread_search_result("recent-1", "duplicate", 95),
+                        _thread_search_result(
+                            "semantic-1", "earlier coping plan", 75, metadata={"kind": "plan"}
+                        ),
+                    ]
+                ),
+                ("GET", "/v1/documents/recent-1/download"): _resp(
+                    content=b"latest check-in"
+                ),
+            }
+        )
+        items = _sync_memory(t).thread("care/42").context(
+            "what helped before?", last_n_turns=2, recent_first=True
+        )
+
+        assert [item.id for item in items] == ["recent-1", "semantic-1"]
+        assert [item.text for item in items] == [
+            "latest check-in",
+            "earlier coping plan",
+        ]
+        assert items[1].score == pytest.approx(0.75)
+        thread_params = t.calls_to("GET", "/v1/threads/care%2F42")[0][2]["params"]
+        assert thread_params == {"last_n_turns": 2, "recent_first": "true"}
+        search_params = t.calls_to("GET", "/v1/search")[0][2]["params"]
+        assert search_params["entity_id"] == "user-42"
+        assert search_params["thread_id"] == "care/42"
+        assert search_params["k"] == 5
+        assert search_params["include_content"] == "true"
+
+    def test_context_retries_committed_turn_while_origin_projection_is_pending(self):
+        pending = _resp(
+            json_data={
+                "error": "Thread turn is committed but its origin projection is still pending",
+                "code": "thread_projection_pending",
+            },
+            status_code=503,
+        )
+        pending.headers = {"retry-after": "0"}
+        t = Transport(
+            {
+                ("GET", "/v1/threads/care%2F42"): _resp(
+                    json_data={
+                        "thread_id": "care/42",
+                        "documents": [_thread_turn("pending-1", 0)],
+                    }
+                ),
+                ("GET", "/v1/search"): _search_resp([]),
+                ("GET", "/v1/documents/pending-1/download"): [
+                    pending,
+                    _resp(content=b"projected turn"),
+                ],
+            }
+        )
+
+        items = _sync_memory(t, max_retries=1).thread("care/42").context("history")
+
+        assert [item.text for item in items] == ["projected turn"]
+        assert len(t.calls_to("GET", "/v1/documents/pending-1/download")) == 2
+
+    def test_context_stops_downloading_when_byte_budget_is_exceeded(self):
+        large_turn = b"x" * (2 * 1024 * 1024 + 1)
+        documents = [_thread_turn(f"turn-{index}", index) for index in range(9)]
+        routes = {
+            ("GET", "/v1/threads/care%2F42"): _resp(
+                json_data={"thread_id": "care/42", "documents": documents}
+            ),
+            ("GET", "/v1/search"): _search_resp([]),
+        }
+        routes.update(
+            {
+                ("GET", f"/v1/documents/turn-{index}/download"): _resp(
+                    content=large_turn
+                )
+                for index in range(9)
+            }
+        )
+        t = Transport(routes)
+
+        with pytest.raises(AetherError, match="byte safety limit"):
+            _sync_memory(t).thread("care/42").context("history", 9)
+
+        assert len(
+            [call for call in t.calls if call[1].endswith("/download")]
+        ) == 8
+        assert t.calls_to("GET", "/v1/documents/turn-8/download") == []
+
+    @pytest.mark.parametrize(
+        ("thread_id", "query", "last_n_turns"),
+        [("", "q", 10), ("care", " ", 10), ("care", "q", 0), ("care", "q", 1001)],
+    )
+    def test_validation_happens_before_transport(self, thread_id, query, last_n_turns):
+        t = Transport({})
+        mem = _sync_memory(t)
+        if not thread_id:
+            with pytest.raises(ValueError, match="thread_id"):
+                mem.thread(thread_id)
+        else:
+            with pytest.raises(ValueError):
+                mem.thread(thread_id).context(query, last_n_turns)
+        assert t.calls == []
+
+    def test_constructors_reject_surrogates_before_transport(self):
+        t = Transport({})
+        mem = _sync_memory(t)
+
+        with pytest.raises(ValueError, match="surrogate"):
+            Thread(mem, "safe\ud800id")
+        with pytest.raises(ValueError, match="surrogate"):
+            mem.thread("safe\udc00id")
+
+        assert t.calls == []
+
+
+class TestAsyncThreadHelper:
+    def test_constructors_reject_surrogates_before_transport(self):
+        t = Transport({})
+        mem = _async_memory(t)
+
+        with pytest.raises(ValueError, match="surrogate"):
+            AsyncThread(mem, "safe\ud800id")
+        with pytest.raises(ValueError, match="surrogate"):
+            mem.thread("safe\udc00id")
+
+        assert t.calls == []
+
+    async def test_async_append_and_context_match_sync_contract(self):
+        t = Transport(
+            {
+                ("POST", "/v1/threads/care%2F42/append"): _resp(
+                    json_data=_thread_turn("turn-1", 0, metadata={"role": "patient"})
+                ),
+                ("GET", "/v1/threads/care%2F42"): _resp(
+                    json_data={
+                        "thread_id": "care/42",
+                        "documents": [_thread_turn("turn-1", 0)],
+                    }
+                ),
+                ("GET", "/v1/search"): _search_resp(
+                    [_thread_search_result("semantic-1", "older context")]
+                ),
+                ("GET", "/v1/documents/turn-1/download"): _resp(
+                    content=b"current turn"
+                ),
+            }
+        )
+        mem = _async_memory(t)
+        thread = AsyncThread(mem, "care/42")
+        assert isinstance(mem.thread("care/42"), AsyncThread)
+
+        appended = await thread.append("current turn", {"role": "patient"})
+        context = await thread.context("prior context")
+
+        assert appended.id == "turn-1"
+        assert [item.id for item in context] == ["turn-1", "semantic-1"]
+        assert [item.text for item in context] == ["current turn", "older context"]
+        search_params = t.calls_to("GET", "/v1/search")[0][2]["params"]
+        assert search_params["entity_id"] == "user-42"
+        assert search_params["thread_id"] == "care/42"
+
+    async def test_context_retries_committed_turn_while_origin_projection_is_pending(self):
+        pending = _resp(
+            json_data={
+                "error": "Thread turn is committed but its origin projection is still pending",
+                "code": "thread_projection_pending",
+            },
+            status_code=503,
+        )
+        pending.headers = {"retry-after": "0"}
+        t = Transport(
+            {
+                ("GET", "/v1/threads/care%2F42"): _resp(
+                    json_data={
+                        "thread_id": "care/42",
+                        "documents": [_thread_turn("pending-1", 0)],
+                    }
+                ),
+                ("GET", "/v1/search"): _search_resp([]),
+                ("GET", "/v1/documents/pending-1/download"): [
+                    pending,
+                    _resp(content=b"projected turn"),
+                ],
+            }
+        )
+
+        items = await _async_memory(t, max_retries=1).thread("care/42").context("history")
+
+        assert [item.text for item in items] == ["projected turn"]
+        assert len(t.calls_to("GET", "/v1/documents/pending-1/download")) == 2
+
+    async def test_context_bounds_concurrent_downloads(self):
+        state = {"active": 0, "peak": 0}
+
+        async def request(method, url, **kwargs):
+            if url == "/v1/threads/care%2F42":
+                return _resp(
+                    json_data={
+                        "thread_id": "care/42",
+                        "documents": [
+                            _thread_turn(f"turn-{index}", index) for index in range(17)
+                        ],
+                    }
+                )
+            if url == "/v1/search":
+                return _search_resp([])
+            if url.endswith("/download"):
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+                await asyncio.sleep(0.005)
+                state["active"] -= 1
+                return _resp(content=b"turn text")
+            raise AssertionError(f"unexpected request: {method} {url} {kwargs}")
+
+        client = AsyncAetherClient(
+            base_url="http://localhost:9000", api_key="k", max_retries=0
+        )
+        patch.object(
+            client._client, "request", new=AsyncMock(side_effect=request)
+        ).start()
+        memory = AsyncMemory("user-42", client=client, now=lambda: FIXED_NOW)
+
+        items = await memory.thread("care/42").context("history", 17)
+
+        assert len(items) == 17
+        assert state["peak"] == 8
+
+    async def test_context_stops_before_next_batch_when_byte_budget_is_exceeded(self):
+        large_turn = b"x" * (2 * 1024 * 1024 + 1)
+        documents = [_thread_turn(f"turn-{index}", index) for index in range(9)]
+        routes = {
+            ("GET", "/v1/threads/care%2F42"): _resp(
+                json_data={"thread_id": "care/42", "documents": documents}
+            ),
+            ("GET", "/v1/search"): _search_resp([]),
+        }
+        routes.update(
+            {
+                ("GET", f"/v1/documents/turn-{index}/download"): _resp(
+                    content=large_turn
+                )
+                for index in range(9)
+            }
+        )
+        t = Transport(routes)
+
+        with pytest.raises(AetherError, match="byte safety limit"):
+            await _async_memory(t).thread("care/42").context("history", 9)
+
+        assert len(
+            [call for call in t.calls if call[1].endswith("/download")]
+        ) == 8
+        assert t.calls_to("GET", "/v1/documents/turn-8/download") == []
