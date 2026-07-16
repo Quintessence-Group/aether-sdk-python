@@ -546,7 +546,7 @@ class AetherClient:
 
     @staticmethod
     def _parse_grounding_receipt(d: dict) -> GroundingReceipt:
-        """Map the authenticated AET-348 grounding response to typed models.
+        """Map the authenticated grounding response to typed models.
 
         The optional ``receipt`` is deliberately a public-safe aggregate; source
         ids/CIDs remain in ``sources`` on this authenticated result only.

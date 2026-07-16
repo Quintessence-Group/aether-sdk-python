@@ -53,7 +53,7 @@ class DocumentRecord:
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     entity_id: Optional[str] = None
-    #: Conversation identity when this document is an AET-151 thread turn.
+    #: Conversation identity when this document is a thread turn.
     thread_id: Optional[str] = None
     #: Zero-based, server-assigned position within ``thread_id``.
     turn_index: Optional[int] = None
@@ -259,7 +259,7 @@ class ShareableReceipt:
 
 @dataclass
 class GroundingReceipt:
-    """Authenticated AET-348 answer-grounding provenance response."""
+    """Authenticated answer-grounding provenance response."""
 
     answer_digest: str
     sources: list[GroundingSource]
@@ -283,7 +283,7 @@ class SearchResult:
     #: belongs to, echoed back by the engine on every hit. ``None`` if the
     #: document has no associated entity.
     entity_id: Optional[str] = None
-    #: Conversation identity when this hit is an AET-151 thread turn.
+    #: Conversation identity when this hit is a thread turn.
     thread_id: Optional[str] = None
     #: Zero-based, server-assigned position within ``thread_id``.
     turn_index: Optional[int] = None
@@ -311,7 +311,7 @@ class SearchResult:
 
 @dataclass
 class ConversationThread:
-    """Canonical tenant-scoped AET-151 conversation in turn order."""
+    """Canonical tenant-scoped conversation in turn order."""
 
     thread_id: str
     documents: list[DocumentRecord] = field(default_factory=list)
@@ -363,7 +363,7 @@ class RetrievalResult:
     passage: Optional[str] = None
     #: Identifier of the entity the matched document belongs to, if any.
     entity_id: Optional[str] = None
-    #: Conversation identity when this result is an AET-151 thread turn.
+    #: Conversation identity when this result is a thread turn.
     thread_id: Optional[str] = None
     #: Zero-based, server-assigned position within ``thread_id``.
     turn_index: Optional[int] = None

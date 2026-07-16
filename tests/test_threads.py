@@ -1,4 +1,4 @@
-"""AET-151 conversational-thread public SDK contract tests."""
+"""Conversational-thread public SDK contract tests."""
 
 import json
 
