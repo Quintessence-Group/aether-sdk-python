@@ -5,6 +5,54 @@ All notable changes to the `aether-ai` Python SDK are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0]
+
+### Added
+
+- **Thread lifecycle.** Whole-thread operations on the raw client —
+  `client.restore_thread(thread_id)`, `client.set_thread_acl(thread_id, acl_readers)`,
+  `client.move_thread(thread_id, to_partition=..., expect_partition=...)`, and
+  `client.delete_thread(thread_id, hard=False)` — each returning a uniform
+  `ThreadLifecycleResult` (`status`, `thread_id`, `turns`). The
+  `memory.thread(thread_id)` facade (`Thread` / `AsyncThread`) gains the same
+  operations as `restore()`, `set_acl(readers)`, `move(to_partition)`, and
+  `delete(hard=False)`. Every operation sends an `Idempotency-Key` (pass
+  `idempotency_key=` to make cross-process retries safe). Turn text is never
+  rewritten — an edit appends a correction turn — and deletes are soft by
+  default; `hard=True` is an irreversible erasure. Mirrored on
+  `AsyncAetherClient`.
+- **Connections API + connect sessions.** Attach an end user's external account
+  (Dropbox today) to their partition from your own backend, without the portal:
+  - `client.create_connect_session(external_user_id, return_url, provider="dropbox", target_partition=None)`
+    mints a hosted OAuth entry point and returns a `ConnectSession`
+    (`session_token`, `connect_url`, a one-time `client_secret`, `expires_at`).
+  - `aether.verify_redirect_signature(client_secret, session=..., status=..., connection_id=..., sig=...)`
+    verifies the signed redirect back to your `return_url` entirely offline
+    (HMAC-SHA256 over `session|status|connection_id`, keyed by
+    `SHA-256(client_secret)`). Standard-library crypto only; no new
+    dependencies.
+  - `client.list_connections(owner_type=..., owner_id=..., include_purged=...)`,
+    `client.get_connection(id)`, `client.resync_connection(id)`,
+    `client.browse_connection(id, path="", cursor=None)`, and
+    `client.update_selection(id, selected_paths)` manage a connection and its
+    sync scope. `client.delete_connection(id)` purges the synced content and
+    returns a `DisconnectResult`; the signed purge receipt is fetchable with
+    `client.get_purge_receipt(receipt_id)` (`ConnectionPurgeReceipt`).
+  - New models: `ConnectSession`, `Connection`, `ConnectionBrowseEntry`,
+    `ConnectionBrowsePage`, `DisconnectResult`, `PurgeSummary`,
+    `ConnectionPurgeReceipt`. All of the above is mirrored on
+    `AsyncAetherClient`.
+- **Typed connect-session errors.** `SessionInvalidError` (HTTP 400,
+  `code="session_invalid"` — the session token is unknown, already used, or
+  expired; mint a new session instead of retrying) and
+  `PartitionMismatchError` (HTTP 400, `code="partition_mismatch"` — the
+  handle's partition disagrees with where the session would resolve). Neither
+  is retryable.
+
+### Notes
+
+- Purely additive: no breaking changes. Existing calls behave exactly as before.
+
 ## [0.5.0]
 
 ### Added
@@ -75,5 +123,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operations — `get`, `download`, `delete`, and `restore` — to the handle's
   partition, matching the scoping already applied to search, insert, and list.
 
+[0.6.0]: https://github.com/quintessence-group/aether-sdk-python/releases/tag/v0.6.0
 [0.5.0]: https://github.com/quintessence-group/aether-sdk-python/releases/tag/v0.5.0
 [0.4.0]: https://github.com/quintessence-group/aether-sdk-python/releases/tag/v0.4.0
