@@ -181,9 +181,17 @@ from .models import (
     BatchInsertItem,
     BatchSearchQuery,
     BatchSearchResponse,
+    Connection,
+    ConnectionBrowseEntry,
+    ConnectionBrowsePage,
+    ConnectionPurgeReceipt,
+    ConnectSession,
+    DisconnectResult,
     DocumentPage,
     DocumentRecord,
     ConversationThread,
+    PurgeSummary,
+    ThreadLifecycleResult,
     QueryGroup,
     EntityBackfillReport,
     GroundingReceipt,
@@ -498,6 +506,15 @@ class AetherClient:
             metadata=dict(d.get("metadata") or {}),
             modality=d.get("modality"),
             derived_text=d.get("derived_text"),
+        )
+
+    @staticmethod
+    def _parse_thread_lifecycle_result(d: dict) -> ThreadLifecycleResult:
+        """Map a whole-thread lifecycle response to a :class:`ThreadLifecycleResult`."""
+        return ThreadLifecycleResult(
+            status=d.get("status", ""),
+            thread_id=d.get("thread_id", ""),
+            turns=d.get("turns", 0),
         )
 
     @staticmethod
@@ -1019,6 +1036,119 @@ class AetherClient:
                 for document in payload.get("documents", [])
             ],
         )
+
+    def restore_thread(
+        self, thread_id: str, *, idempotency_key: str | None = None
+    ) -> ThreadLifecycleResult:
+        """Restore (un-tombstone) a soft-deleted conversation thread.
+
+        Reverses a soft :meth:`delete_thread`. Owner/admin-scoped. Mirrors
+        :meth:`append_thread`'s idempotency handling: when *idempotency_key*
+        is omitted the POST retry transport mints one stable key for this
+        logical call so a lost-response retry is deduplicated server-side. A
+        partition handle injects its hard partition boundary automatically.
+        Returns the engine's :class:`ThreadLifecycleResult`
+        (``status``/``thread_id``/``turns``).
+        """
+        _validate_thread_id(thread_id)
+        url = _with_partition_guard(
+            f"/threads/{quote(thread_id, safe='')}/restore", self._partition
+        )
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        resp = self._request_with_retry("POST", url, headers=headers)
+        self._raise_for_status(resp)
+        return self._parse_thread_lifecycle_result(resp.json())
+
+    def set_thread_acl(
+        self,
+        thread_id: str,
+        acl_readers: list[str] | None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> ThreadLifecycleResult:
+        """Replace a thread's read-ACL (owner/admin-scoped).
+
+        The three states are distinct and all meaningful, mirroring document
+        ACLs: ``None`` unlabels the thread (tenant-visible), ``[]`` quarantines
+        it to admin-role keys only, and ``["user:a", "group:b"]`` restricts
+        reads to those labels. ``PUT`` is not auto-idempotent in the transport,
+        so a stable ``Idempotency-Key`` is minted here when one is not supplied.
+        Returns the engine's :class:`ThreadLifecycleResult`
+        (``status``/``thread_id``/``turns``).
+        """
+        _validate_thread_id(thread_id)
+        body: dict[str, Any] = {
+            "acl_readers": _validate_acl_readers(acl_readers)
+            if acl_readers is not None
+            else None
+        }
+        url = _with_partition_guard(
+            f"/threads/{quote(thread_id, safe='')}/acl", self._partition
+        )
+        headers = {"Idempotency-Key": idempotency_key or new_idempotency_key()}
+        resp = self._request_with_retry("PUT", url, json=body, headers=headers)
+        self._raise_for_status(resp)
+        return self._parse_thread_lifecycle_result(resp.json())
+
+    def move_thread(
+        self,
+        thread_id: str,
+        *,
+        to_partition: str | None,
+        expect_partition: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> ThreadLifecycleResult:
+        """Move a thread between partitions (owner/admin-scoped).
+
+        *expect_partition* is the partition the thread is expected to currently
+        be in — the move is a compare-and-swap that only applies if that
+        precondition holds (``None`` expects the unpartitioned default).
+        *to_partition* is the destination (``None`` moves it to the
+        unpartitioned default). Mirrors :meth:`append_thread`'s idempotency
+        handling for the POST. Like :meth:`move_document`, the move names both
+        partitions in the body (``expect_partition``/``to_partition``) and is
+        deliberately **not** query-scoped by a partition handle — the path is a
+        bare ``/threads/{id}/move`` with no ``?partition=`` guard. Returns the
+        engine's :class:`ThreadLifecycleResult` (``status``/``thread_id``/``turns``).
+        """
+        _validate_thread_id(thread_id)
+        body: dict[str, Any] = {
+            "expect_partition": expect_partition,
+            "to_partition": to_partition,
+        }
+        url = f"/threads/{quote(thread_id, safe='')}/move"
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        resp = self._request_with_retry("POST", url, json=body, headers=headers)
+        self._raise_for_status(resp)
+        return self._parse_thread_lifecycle_result(resp.json())
+
+    def delete_thread(
+        self,
+        thread_id: str,
+        *,
+        hard: bool = False,
+        idempotency_key: str | None = None,
+    ) -> ThreadLifecycleResult:
+        """Delete a conversation thread (owner/admin-scoped).
+
+        By default this is a soft delete: the thread is tombstoned and can be
+        brought back with :meth:`restore_thread`. Pass ``hard=True`` for a
+        permanent, **irreversible** crypto hard delete via the ``?hard=true``
+        route — the thread's encryption key is shredded and nothing is
+        recoverable afterwards. ``DELETE`` is not auto-idempotent in the
+        transport, so a stable ``Idempotency-Key`` is minted here when one is
+        not supplied. Returns the engine's :class:`ThreadLifecycleResult`
+        (``status``/``thread_id``/``turns``).
+        """
+        _validate_thread_id(thread_id)
+        path = f"/threads/{quote(thread_id, safe='')}"
+        if hard:
+            path += "?hard=true"
+        url = _with_partition_guard(path, self._partition)
+        headers = {"Idempotency-Key": idempotency_key or new_idempotency_key()}
+        resp = self._request_with_retry("DELETE", url, headers=headers)
+        self._raise_for_status(resp)
+        return self._parse_thread_lifecycle_result(resp.json())
 
     def insert_stream(
         self,
@@ -1906,6 +2036,208 @@ class AetherClient:
         resp = self._request_with_retry("DELETE", f"/partitions/{quote(partition_id, safe='')}")
         self._raise_for_status(resp)
         return resp.json().get("documents_deleted", 0)
+
+    # ── Connections + connect sessions ──
+
+    def create_connect_session(
+        self,
+        external_user_id: str,
+        return_url: str,
+        *,
+        provider: str = "dropbox",
+        target_partition: Optional[str] = None,
+    ) -> ConnectSession:
+        """Mint a connect session — the entry point for connecting one of
+        *your* end users' sources (mode B). Open the returned
+        ``connect_url`` in the end user's browser to start the hosted OAuth
+        flow.
+
+        On a partition handle, the handle's partition must equal the
+        placement this session will resolve to (``external_user_id``, or
+        ``target_partition`` if given) — a scoped handle for end user X can
+        mint a session only for X. See §4.18.
+
+        ``client_secret`` is returned exactly once. Store it server-side;
+        use it with :func:`aether.connections.verify_redirect_signature`
+        when the end user lands back on ``return_url``.
+        """
+        if not external_user_id:
+            raise ValueError("external_user_id is required")
+        if not return_url:
+            raise ValueError("return_url is required")
+        body: dict[str, Any] = {
+            "provider": provider,
+            "external_user_id": external_user_id,
+            "return_url": return_url,
+        }
+        if target_partition:
+            body["target_partition"] = target_partition
+        url = "/connections/sessions"
+        if self._partition:
+            url += f"?partition={quote(self._partition)}"
+        resp = self._request_with_retry("POST", url, json=body)
+        self._raise_for_status(resp)
+        raw = resp.json()
+        return ConnectSession(
+            session_token=raw["session_token"],
+            connect_url=raw["connect_url"],
+            client_secret=raw["client_secret"],
+            expires_at=raw["expires_at"],
+        )
+
+    def list_connections(
+        self,
+        *,
+        owner_type: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        include_purged: bool = True,
+    ) -> list[Connection]:
+        """List connections in scope: the whole tenant when unscoped, or one
+        partition's under a handle (§4.18)."""
+        url = "/connections"
+        params: list[str] = []
+        if self._partition:
+            params.append(f"partition={quote(self._partition)}")
+        if owner_type:
+            params.append(f"owner_type={quote(owner_type)}")
+        if owner_id:
+            params.append(f"owner_id={quote(owner_id)}")
+        if not include_purged:
+            params.append("include_purged=false")
+        if params:
+            url += "?" + "&".join(params)
+        resp = self._request_with_retry("GET", url)
+        self._raise_for_status(resp)
+        return [Connection._from_wire(c) for c in resp.json().get("connections", [])]
+
+    def get_connection(self, connection_id: str) -> Connection:
+        """Fetch one connection. On a handle, a connection in a different
+        partition 404s exactly like an unknown id."""
+        if not connection_id:
+            raise ValueError("connection_id is required")
+        url = _with_partition_guard(f"/connections/{quote(connection_id, safe='')}", self._partition)
+        resp = self._request_with_retry("GET", url)
+        self._raise_for_status(resp)
+        return Connection._from_wire(resp.json())
+
+    def delete_connection(self, connection_id: str) -> DisconnectResult:
+        """Disconnect: revoke upstream, destroy the stored credential,
+        hard-delete every document this connection synced, and issue a
+        signed purge receipt. Idempotent — disconnecting an already-purged
+        connection re-reports the same result. Fetch the full receipt with
+        :meth:`get_purge_receipt`."""
+        if not connection_id:
+            raise ValueError("connection_id is required")
+        url = _with_partition_guard(f"/connections/{quote(connection_id, safe='')}", self._partition)
+        resp = self._request_with_retry("DELETE", url)
+        self._raise_for_status(resp)
+        raw = resp.json()
+        purge_raw = raw.get("purge")
+        purge = (
+            PurgeSummary(
+                receipt_id=purge_raw["receipt_id"],
+                documents_purged=purge_raw["documents_purged"],
+                merkle_root=purge_raw["merkle_root"],
+                completed_at=purge_raw["completed_at"],
+                signer_node_id=purge_raw["signer_node_id"],
+            )
+            if purge_raw
+            else None
+        )
+        return DisconnectResult(connection_id=raw["connection_id"], status=raw["status"], purge=purge)
+
+    def resync_connection(self, connection_id: str) -> Connection:
+        """Re-drive sync for one connection. Honest, narrow semantics: this
+        clears the connection's backoff and (if it was paused/errored) flips
+        it back to active — it does **not** run a sync inline. The
+        connection becomes eligible on the sync loop's next scheduled
+        pass."""
+        if not connection_id:
+            raise ValueError("connection_id is required")
+        url = _with_partition_guard(
+            f"/connections/{quote(connection_id, safe='')}/resync", self._partition
+        )
+        resp = self._request_with_retry("POST", url)
+        self._raise_for_status(resp)
+        # The resync response is a slim {connection_id, status}; fetch the
+        # full record so callers get one consistent shape everywhere.
+        return self.get_connection(connection_id)
+
+    def browse_connection(
+        self, connection_id: str, *, path: str = "", cursor: Optional[str] = None
+    ) -> ConnectionBrowsePage:
+        """One page of a connection's source folder listing, for a
+        folder-picker UI. ``cursor=None`` browses ``path`` fresh; pass back
+        ``next_cursor`` to continue."""
+        if not connection_id:
+            raise ValueError("connection_id is required")
+        url = _with_partition_guard(
+            f"/connections/{quote(connection_id, safe='')}/browse", self._partition
+        )
+        resp = self._request_with_retry("POST", url, json={"path": path, "cursor": cursor})
+        self._raise_for_status(resp)
+        raw = resp.json()
+        entries = [
+            ConnectionBrowseEntry(
+                name=e["name"],
+                path_display=e["path_display"],
+                is_folder=e["is_folder"],
+                size_bytes=e.get("size_bytes"),
+                modified=e.get("modified"),
+            )
+            for e in raw.get("entries", [])
+        ]
+        return ConnectionBrowsePage(entries=entries, next_cursor=raw.get("next_cursor"))
+
+    def update_selection(self, connection_id: str, selected_paths: list[str]) -> list[str]:
+        """Replace a connection's synced-path scope outright (not a merge —
+        send the full intended set; an empty list means the whole account).
+        Returns the normalized list actually stored."""
+        if not connection_id:
+            raise ValueError("connection_id is required")
+        url = _with_partition_guard(
+            f"/connections/{quote(connection_id, safe='')}/selection", self._partition
+        )
+        resp = self._request_with_retry("PUT", url, json={"selected_paths": selected_paths})
+        self._raise_for_status(resp)
+        return resp.json().get("selected_paths", [])
+
+    def get_purge_receipt(self, receipt_id: str) -> ConnectionPurgeReceipt:
+        """Fetch a connection's disconnect-purge receipt — the full signed
+        proof, including every purged document id, the Merkle root, the
+        Ed25519 signature, and the node's own ``verified`` re-check."""
+        if not receipt_id:
+            raise ValueError("receipt_id is required")
+        url = _with_partition_guard(
+            f"/connections/purge-receipts/{quote(receipt_id, safe='')}", self._partition
+        )
+        resp = self._request_with_retry("GET", url)
+        self._raise_for_status(resp)
+        raw = resp.json()
+        return ConnectionPurgeReceipt(
+            version=raw["version"],
+            receipt_id=raw["receipt_id"],
+            tenant_id=raw["tenant_id"],
+            connection_id=raw["connection_id"],
+            provider=raw["provider"],
+            owner=raw["owner"],
+            provider_account_id=raw["provider_account_id"],
+            documents_purged=raw["documents_purged"],
+            documents_failed=raw["documents_failed"],
+            merkle_root=raw["merkle_root"],
+            merkle_leaf_count=raw["merkle_leaf_count"],
+            purged_document_ids=raw.get("purged_document_ids", []),
+            partitions_touched=raw.get("partitions_touched", []),
+            default_partition_touched=raw["default_partition_touched"],
+            credential_revocation=raw["credential_revocation"],
+            credential_deleted=raw["credential_deleted"],
+            started_at=raw["started_at"],
+            completed_at=raw["completed_at"],
+            signer_node_id=raw["signer_node_id"],
+            signer_public_key=raw["signer_public_key"],
+            signature=raw["signature"],
+            verified=raw["verified"],
+        )
 
     # ── BYOE (Bring Your Own Embeddings) ────────────────────────────
 

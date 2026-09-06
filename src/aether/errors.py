@@ -84,6 +84,24 @@ class PrincipalPinMismatchError(AetherApiError):
     """
 
 
+class SessionInvalidError(AetherApiError):
+    """Raised when a connect-session token is unknown, already consumed, or
+    expired (HTTP 400, ``code="session_invalid"``). The three cases are
+    deliberately indistinguishable — mint a new session with
+    :meth:`AetherClient.create_connect_session` rather than retrying the
+    same token.
+    """
+
+
+class PartitionMismatchError(AetherApiError):
+    """Raised when :meth:`AetherClient.create_connect_session`'s asserted
+    partition (from a partition handle) disagrees with the partition the
+    session would actually resolve to (HTTP 400,
+    ``code="partition_mismatch"``). Mint on a handle scoped to the same
+    ``external_user_id`` you are passing, or omit the handle.
+    """
+
+
 def aether_api_error_from_response(
     status_code: int,
     message: str,
@@ -106,6 +124,10 @@ def aether_api_error_from_response(
         cls = PrincipalPinMismatchError
     elif status_code == 400 and error_code == "partition_required":
         cls = PartitionRequiredError
+    elif status_code == 400 and error_code == "session_invalid":
+        cls = SessionInvalidError
+    elif status_code == 400 and error_code == "partition_mismatch":
+        cls = PartitionMismatchError
     else:
         cls = AetherApiError
     return cls(

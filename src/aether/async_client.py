@@ -39,9 +39,17 @@ from .models import (
     BatchInsertItem,
     BatchSearchQuery,
     BatchSearchResponse,
+    Connection,
+    ConnectionBrowseEntry,
+    ConnectionBrowsePage,
+    ConnectionPurgeReceipt,
+    ConnectSession,
+    DisconnectResult,
     DocumentPage,
     DocumentRecord,
     ConversationThread,
+    PurgeSummary,
+    ThreadLifecycleResult,
     QueryGroup,
     EntityBackfillReport,
     GroundingReceipt,
@@ -340,6 +348,15 @@ class AsyncAetherClient:
             metadata=dict(d.get("metadata") or {}),
             modality=d.get("modality"),
             derived_text=d.get("derived_text"),
+        )
+
+    @staticmethod
+    def _parse_thread_lifecycle_result(d: dict) -> ThreadLifecycleResult:
+        """Map a whole-thread lifecycle response to a :class:`ThreadLifecycleResult`."""
+        return ThreadLifecycleResult(
+            status=d.get("status", ""),
+            thread_id=d.get("thread_id", ""),
+            turns=d.get("turns", 0),
         )
 
     @staticmethod
@@ -706,6 +723,79 @@ class AsyncAetherClient:
                 for document in payload.get("documents", [])
             ],
         )
+
+    async def restore_thread(
+        self, thread_id: str, *, idempotency_key: str | None = None
+    ) -> ThreadLifecycleResult:
+        """Async mirror of :meth:`AetherClient.restore_thread`."""
+        _validate_thread_id(thread_id)
+        url = _with_partition_guard(
+            f"/threads/{quote(thread_id, safe='')}/restore", self._partition
+        )
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        resp = await self._request_with_retry("POST", url, headers=headers)
+        self._raise_for_status(resp)
+        return self._parse_thread_lifecycle_result(resp.json())
+
+    async def set_thread_acl(
+        self,
+        thread_id: str,
+        acl_readers: list[str] | None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> ThreadLifecycleResult:
+        """Async mirror of :meth:`AetherClient.set_thread_acl`."""
+        _validate_thread_id(thread_id)
+        body: dict[str, Any] = {
+            "acl_readers": _validate_acl_readers(acl_readers)
+            if acl_readers is not None
+            else None
+        }
+        url = _with_partition_guard(
+            f"/threads/{quote(thread_id, safe='')}/acl", self._partition
+        )
+        headers = {"Idempotency-Key": idempotency_key or new_idempotency_key()}
+        resp = await self._request_with_retry("PUT", url, json=body, headers=headers)
+        self._raise_for_status(resp)
+        return self._parse_thread_lifecycle_result(resp.json())
+
+    async def move_thread(
+        self,
+        thread_id: str,
+        *,
+        to_partition: str | None,
+        expect_partition: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> ThreadLifecycleResult:
+        """Async mirror of :meth:`AetherClient.move_thread`."""
+        _validate_thread_id(thread_id)
+        body: dict[str, Any] = {
+            "expect_partition": expect_partition,
+            "to_partition": to_partition,
+        }
+        url = f"/threads/{quote(thread_id, safe='')}/move"
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        resp = await self._request_with_retry("POST", url, json=body, headers=headers)
+        self._raise_for_status(resp)
+        return self._parse_thread_lifecycle_result(resp.json())
+
+    async def delete_thread(
+        self,
+        thread_id: str,
+        *,
+        hard: bool = False,
+        idempotency_key: str | None = None,
+    ) -> ThreadLifecycleResult:
+        """Async mirror of :meth:`AetherClient.delete_thread`."""
+        _validate_thread_id(thread_id)
+        path = f"/threads/{quote(thread_id, safe='')}"
+        if hard:
+            path += "?hard=true"
+        url = _with_partition_guard(path, self._partition)
+        headers = {"Idempotency-Key": idempotency_key or new_idempotency_key()}
+        resp = await self._request_with_retry("DELETE", url, headers=headers)
+        self._raise_for_status(resp)
+        return self._parse_thread_lifecycle_result(resp.json())
 
     async def insert_stream(
         self,
@@ -1425,6 +1515,181 @@ class AsyncAetherClient:
         resp = await self._request_with_retry("DELETE", f"/partitions/{quote(partition_id, safe='')}")
         self._raise_for_status(resp)
         return resp.json().get("documents_deleted", 0)
+
+    # ── Connections + connect sessions ──
+
+    async def create_connect_session(
+        self,
+        external_user_id: str,
+        return_url: str,
+        *,
+        provider: str = "dropbox",
+        target_partition: Optional[str] = None,
+    ) -> ConnectSession:
+        """Mint a connect session. See :meth:`AetherClient.create_connect_session`."""
+        if not external_user_id:
+            raise ValueError("external_user_id is required")
+        if not return_url:
+            raise ValueError("return_url is required")
+        body: dict = {
+            "provider": provider,
+            "external_user_id": external_user_id,
+            "return_url": return_url,
+        }
+        if target_partition:
+            body["target_partition"] = target_partition
+        url = "/connections/sessions"
+        if self._partition:
+            url += f"?partition={quote(self._partition)}"
+        resp = await self._request_with_retry("POST", url, json=body)
+        self._raise_for_status(resp)
+        raw = resp.json()
+        return ConnectSession(
+            session_token=raw["session_token"],
+            connect_url=raw["connect_url"],
+            client_secret=raw["client_secret"],
+            expires_at=raw["expires_at"],
+        )
+
+    async def list_connections(
+        self,
+        *,
+        owner_type: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        include_purged: bool = True,
+    ) -> list[Connection]:
+        """List connections in scope. See :meth:`AetherClient.list_connections`."""
+        url = "/connections"
+        params: list[str] = []
+        if self._partition:
+            params.append(f"partition={quote(self._partition)}")
+        if owner_type:
+            params.append(f"owner_type={quote(owner_type)}")
+        if owner_id:
+            params.append(f"owner_id={quote(owner_id)}")
+        if not include_purged:
+            params.append("include_purged=false")
+        if params:
+            url += "?" + "&".join(params)
+        resp = await self._request_with_retry("GET", url)
+        self._raise_for_status(resp)
+        return [Connection._from_wire(c) for c in resp.json().get("connections", [])]
+
+    async def get_connection(self, connection_id: str) -> Connection:
+        """Fetch one connection. See :meth:`AetherClient.get_connection`."""
+        if not connection_id:
+            raise ValueError("connection_id is required")
+        url = _with_partition_guard(f"/connections/{quote(connection_id, safe='')}", self._partition)
+        resp = await self._request_with_retry("GET", url)
+        self._raise_for_status(resp)
+        return Connection._from_wire(resp.json())
+
+    async def delete_connection(self, connection_id: str) -> DisconnectResult:
+        """Disconnect. See :meth:`AetherClient.delete_connection`."""
+        if not connection_id:
+            raise ValueError("connection_id is required")
+        url = _with_partition_guard(f"/connections/{quote(connection_id, safe='')}", self._partition)
+        resp = await self._request_with_retry("DELETE", url)
+        self._raise_for_status(resp)
+        raw = resp.json()
+        purge_raw = raw.get("purge")
+        purge = (
+            PurgeSummary(
+                receipt_id=purge_raw["receipt_id"],
+                documents_purged=purge_raw["documents_purged"],
+                merkle_root=purge_raw["merkle_root"],
+                completed_at=purge_raw["completed_at"],
+                signer_node_id=purge_raw["signer_node_id"],
+            )
+            if purge_raw
+            else None
+        )
+        return DisconnectResult(connection_id=raw["connection_id"], status=raw["status"], purge=purge)
+
+    async def resync_connection(self, connection_id: str) -> Connection:
+        """Re-drive sync for one connection. See
+        :meth:`AetherClient.resync_connection`."""
+        if not connection_id:
+            raise ValueError("connection_id is required")
+        url = _with_partition_guard(
+            f"/connections/{quote(connection_id, safe='')}/resync", self._partition
+        )
+        resp = await self._request_with_retry("POST", url)
+        self._raise_for_status(resp)
+        return await self.get_connection(connection_id)
+
+    async def browse_connection(
+        self, connection_id: str, *, path: str = "", cursor: Optional[str] = None
+    ) -> ConnectionBrowsePage:
+        """One page of a connection's source folder listing. See
+        :meth:`AetherClient.browse_connection`."""
+        if not connection_id:
+            raise ValueError("connection_id is required")
+        url = _with_partition_guard(
+            f"/connections/{quote(connection_id, safe='')}/browse", self._partition
+        )
+        resp = await self._request_with_retry("POST", url, json={"path": path, "cursor": cursor})
+        self._raise_for_status(resp)
+        raw = resp.json()
+        entries = [
+            ConnectionBrowseEntry(
+                name=e["name"],
+                path_display=e["path_display"],
+                is_folder=e["is_folder"],
+                size_bytes=e.get("size_bytes"),
+                modified=e.get("modified"),
+            )
+            for e in raw.get("entries", [])
+        ]
+        return ConnectionBrowsePage(entries=entries, next_cursor=raw.get("next_cursor"))
+
+    async def update_selection(self, connection_id: str, selected_paths: list[str]) -> list[str]:
+        """Replace a connection's synced-path scope outright. See
+        :meth:`AetherClient.update_selection`."""
+        if not connection_id:
+            raise ValueError("connection_id is required")
+        url = _with_partition_guard(
+            f"/connections/{quote(connection_id, safe='')}/selection", self._partition
+        )
+        resp = await self._request_with_retry("PUT", url, json={"selected_paths": selected_paths})
+        self._raise_for_status(resp)
+        return resp.json().get("selected_paths", [])
+
+    async def get_purge_receipt(self, receipt_id: str) -> ConnectionPurgeReceipt:
+        """Fetch a connection's disconnect-purge receipt. See
+        :meth:`AetherClient.get_purge_receipt`."""
+        if not receipt_id:
+            raise ValueError("receipt_id is required")
+        url = _with_partition_guard(
+            f"/connections/purge-receipts/{quote(receipt_id, safe='')}", self._partition
+        )
+        resp = await self._request_with_retry("GET", url)
+        self._raise_for_status(resp)
+        raw = resp.json()
+        return ConnectionPurgeReceipt(
+            version=raw["version"],
+            receipt_id=raw["receipt_id"],
+            tenant_id=raw["tenant_id"],
+            connection_id=raw["connection_id"],
+            provider=raw["provider"],
+            owner=raw["owner"],
+            provider_account_id=raw["provider_account_id"],
+            documents_purged=raw["documents_purged"],
+            documents_failed=raw["documents_failed"],
+            merkle_root=raw["merkle_root"],
+            merkle_leaf_count=raw["merkle_leaf_count"],
+            purged_document_ids=raw.get("purged_document_ids", []),
+            partitions_touched=raw.get("partitions_touched", []),
+            default_partition_touched=raw["default_partition_touched"],
+            credential_revocation=raw["credential_revocation"],
+            credential_deleted=raw["credential_deleted"],
+            started_at=raw["started_at"],
+            completed_at=raw["completed_at"],
+            signer_node_id=raw["signer_node_id"],
+            signer_public_key=raw["signer_public_key"],
+            signature=raw["signature"],
+            verified=raw["verified"],
+        )
 
     async def retrieve(
         self,
