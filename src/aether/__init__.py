@@ -4,6 +4,7 @@ from ._internal import __version__
 from .async_client import AsyncAetherClient
 from .audit import AsyncAuditClient, AuditClient
 from .client import AetherClient
+from .connections import verify_redirect_signature
 from .importers import Mem0ImportReport, import_mem0
 from .memory import (
     AsyncThread,
@@ -22,8 +23,10 @@ from .errors import (
     AetherNetworkError,
     CreditExhaustedError,
     FreeLimitExceededError,
+    PartitionMismatchError,
     PartitionRequiredError,
     PrincipalPinMismatchError,
+    SessionInvalidError,
     TenantPausedError,
     aether_api_error_from_response,
 )
@@ -35,9 +38,17 @@ from .models import (
     BatchInsertItem,
     BatchSearchQuery,
     BatchSearchResponse,
+    Connection,
+    ConnectionBrowseEntry,
+    ConnectionBrowsePage,
+    ConnectionPurgeReceipt,
+    ConnectSession,
+    DisconnectResult,
     DocumentPage,
     DocumentRecord,
     ConversationThread,
+    PurgeSummary,
+    ThreadLifecycleResult,
     EntityBackfillReport,
     FieldSchema,
     GroundingReceipt,
@@ -77,8 +88,18 @@ __all__ = [
     "FreeLimitExceededError",
     "PartitionRequiredError",
     "PrincipalPinMismatchError",
+    "SessionInvalidError",
+    "PartitionMismatchError",
     "TenantPausedError",
     "aether_api_error_from_response",
+    "verify_redirect_signature",
+    "Connection",
+    "ConnectionBrowseEntry",
+    "ConnectionBrowsePage",
+    "ConnectionPurgeReceipt",
+    "ConnectSession",
+    "DisconnectResult",
+    "PurgeSummary",
     "AccessAuditPage",
     "AuditClient",
     "AsyncAuditClient",
@@ -90,6 +111,7 @@ __all__ = [
     "DocumentPage",
     "DocumentRecord",
     "ConversationThread",
+    "ThreadLifecycleResult",
     "EntityBackfillReport",
     "GroundingReceipt",
     "GroundingBinding",

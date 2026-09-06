@@ -1177,7 +1177,7 @@ class TestGraphAsync:
         assert report.retracted == 1
 
 
-# ── entity-scoped Thread helper ─────────────────────────────
+# ── Entity-scoped Thread helper ─────────────────────────────
 
 
 def _thread_turn(

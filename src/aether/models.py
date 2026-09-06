@@ -318,6 +318,22 @@ class ConversationThread:
 
 
 @dataclass
+class ThreadLifecycleResult:
+    """Result of a whole-thread lifecycle mutation — ``restore_thread``,
+    ``set_thread_acl``, ``move_thread``, or ``delete_thread`` (and their
+    ``Thread`` / ``AsyncThread`` facade equivalents).
+    """
+
+    #: The applied action: ``"tombstoned"``, ``"restored"``, ``"acl_updated"``,
+    #: ``"hard_deleted"``, or ``"moved"``.
+    status: str
+    thread_id: str
+    #: Number of turns whose canonical marker (tombstone / ACL / partition) was
+    #: rewritten by the op.
+    turns: int = 0
+
+
+@dataclass
 class IngestResult:
     """Outcome of ingesting a single file via ``ingest_files`` /
     ``ingest_directory``.
@@ -574,3 +590,145 @@ class AggregateResult:
     total_groups: int
     #: Documents folded into the aggregation (post-filter).
     scanned: int
+
+
+# ── Connections + connect sessions ────
+
+
+@dataclass
+class ConnectSession:
+    """Response of :meth:`AetherClient.create_connect_session`."""
+    #: Opaque, single-use. Embedded in ``connect_url``.
+    session_token: str
+    #: Open this in the end user's browser to start the hosted OAuth flow.
+    connect_url: str
+    #: Returned exactly once. Store server-side; use it with
+    #: :func:`aether.connections.verify_redirect_signature`.
+    client_secret: str
+    expires_at: str
+
+
+@dataclass
+class Connection:
+    """One connection — a developer's own source (mode A) or one end user's
+    (mode B). Never carries credential material."""
+    connection_id: str
+    provider: str
+    owner_type: str  # "tenant" | "external_user"
+    owner_id: Optional[str]
+    provider_account_id: str
+    account_display_name: Optional[str]
+    #: ``None`` for mode A (the tenant's default partition); the end user's
+    #: id for mode B.
+    target_partition: Optional[str]
+    status: str
+    granted_scopes: list[str]
+    created_at: str
+    last_sync_at: Optional[str]
+    last_error: Optional[str]
+    files_synced: int
+    files_skipped: int
+    files_deleted: int
+    selected_paths: list[str]
+    purge_state: str  # "not_started" | "in_flight" | "complete"
+    purge_receipt_id: Optional[str]
+    credential_deleted: bool
+    #: True when this row's provider-side identity was withheld because the
+    #: call was not scoped to the connection's partition: ``provider_account_id``
+    #: is then ``""`` and ``account_display_name`` ``None``. Every other field
+    #: is real. Pass ``partition=`` — the same scope the by-id routes require —
+    #: to get the identity. Always ``False`` for mode-A connections and on
+    #: by-id reads. Defaulted so an older engine simply never redacts.
+    identity_redacted: bool = False
+
+    @classmethod
+    def _from_wire(cls, body: dict) -> "Connection":
+        return cls(
+            connection_id=body["connection_id"],
+            provider=body["provider"],
+            owner_type=body["owner_type"],
+            owner_id=body.get("owner_id"),
+            provider_account_id=body["provider_account_id"],
+            account_display_name=body.get("account_display_name"),
+            target_partition=body.get("target_partition"),
+            status=body["status"],
+            granted_scopes=body.get("granted_scopes", []),
+            created_at=body["created_at"],
+            last_sync_at=body.get("last_sync_at"),
+            last_error=body.get("last_error"),
+            files_synced=body.get("files_synced", 0),
+            files_skipped=body.get("files_skipped", 0),
+            files_deleted=body.get("files_deleted", 0),
+            selected_paths=body.get("selected_paths", []),
+            purge_state=body.get("purge_state", "not_started"),
+            purge_receipt_id=body.get("purge_receipt_id"),
+            credential_deleted=body.get("credential_deleted", False),
+            identity_redacted=body.get("identity_redacted", False),
+        )
+
+
+@dataclass
+class PurgeSummary:
+    """Summary of what a disconnect destroyed. Only present on
+    :attr:`DisconnectResult.purge` when the connection actually existed."""
+    receipt_id: str
+    documents_purged: int
+    merkle_root: str
+    completed_at: str
+    signer_node_id: str
+
+
+@dataclass
+class DisconnectResult:
+    """Result of :meth:`AetherClient.delete_connection`."""
+    connection_id: str
+    status: str
+    #: ``None`` only when the connection did not exist (the idempotent
+    #: no-op) — a disconnect that ran always produces a receipt.
+    purge: Optional["PurgeSummary"] = None
+
+
+@dataclass
+class ConnectionPurgeReceipt:
+    """The full signed proof :meth:`AetherClient.get_purge_receipt` returns."""
+    version: str
+    receipt_id: str
+    tenant_id: str
+    connection_id: str
+    provider: str
+    owner: str
+    provider_account_id: str
+    documents_purged: int
+    documents_failed: int
+    merkle_root: str
+    merkle_leaf_count: int
+    purged_document_ids: list[str]
+    partitions_touched: list[str]
+    default_partition_touched: bool
+    credential_revocation: str
+    credential_deleted: bool
+    started_at: str
+    completed_at: str
+    signer_node_id: str
+    signer_public_key: str
+    signature: str
+    #: The node's own re-verification of the row at read time.
+    verified: bool
+
+
+@dataclass
+class ConnectionBrowseEntry:
+    """One entry in a :meth:`AetherClient.browse_connection` page."""
+    name: str
+    path_display: str
+    is_folder: bool
+    size_bytes: Optional[int] = None
+    modified: Optional[str] = None
+
+
+@dataclass
+class ConnectionBrowsePage:
+    """One page of :meth:`AetherClient.browse_connection`."""
+    entries: list["ConnectionBrowseEntry"]
+    #: Present iff another page exists; pass back as the next call's ``cursor``.
+    next_cursor: Optional[str] = None

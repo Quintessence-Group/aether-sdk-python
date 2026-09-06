@@ -27,7 +27,7 @@ from urllib.request import Request, urlopen
 from .async_client import AsyncAetherClient
 from .client import AetherClient, _validate_thread_id
 from .errors import AetherError
-from .models import Metadata, MetadataFilter
+from .models import Metadata, MetadataFilter, ThreadLifecycleResult
 
 # Algorithm constants — see MEMORY_CONTRACT.md §4 Mode B. Identical across all
 # four SDKs so the contract test produces the same ordering everywhere.
@@ -1665,6 +1665,44 @@ class Thread:
             )
         return items
 
+    def restore(self) -> ThreadLifecycleResult:
+        """Restore this thread if it was soft-deleted (un-tombstone).
+
+        Returns the engine's :class:`ThreadLifecycleResult`.
+        """
+        return self.memory.client.restore_thread(self.thread_id)
+
+    def set_acl(self, readers: Optional[list[str]]) -> ThreadLifecycleResult:
+        """Replace this thread's read-ACL.
+
+        ``None`` unlabels the thread (tenant-visible), ``[]`` quarantines it to
+        admin-role keys only, and a non-empty list restricts reads to those
+        labels. Returns the engine's :class:`ThreadLifecycleResult`.
+        """
+        return self.memory.client.set_thread_acl(self.thread_id, readers)
+
+    def move(self, to_partition: Optional[str]) -> ThreadLifecycleResult:
+        """Move this thread to *to_partition*.
+
+        The thread's current partition (the Memory client's partition scope, if
+        any) is sent as the ``expect_partition`` compare-and-swap precondition.
+        Returns the engine's :class:`ThreadLifecycleResult`.
+        """
+        return self.memory.client.move_thread(
+            self.thread_id,
+            to_partition=to_partition,
+            expect_partition=getattr(self.memory.client, "_partition", None),
+        )
+
+    def delete(self, hard: bool = False) -> ThreadLifecycleResult:
+        """Delete this thread.
+
+        Soft-tombstones by default (recoverable with :meth:`restore`); pass
+        ``hard=True`` for the irreversible crypto hard delete. Returns the
+        engine's :class:`ThreadLifecycleResult`.
+        """
+        return self.memory.client.delete_thread(self.thread_id, hard=hard)
+
 
 class AsyncThread:
     """Async counterpart to :class:`Thread`, composed over AsyncMemory."""
@@ -1757,3 +1795,23 @@ class AsyncThread:
                 )
             )
         return items
+
+    async def restore(self) -> ThreadLifecycleResult:
+        """Async mirror of :meth:`Thread.restore`."""
+        return await self.memory.client.restore_thread(self.thread_id)
+
+    async def set_acl(self, readers: Optional[list[str]]) -> ThreadLifecycleResult:
+        """Async mirror of :meth:`Thread.set_acl`."""
+        return await self.memory.client.set_thread_acl(self.thread_id, readers)
+
+    async def move(self, to_partition: Optional[str]) -> ThreadLifecycleResult:
+        """Async mirror of :meth:`Thread.move`."""
+        return await self.memory.client.move_thread(
+            self.thread_id,
+            to_partition=to_partition,
+            expect_partition=getattr(self.memory.client, "_partition", None),
+        )
+
+    async def delete(self, hard: bool = False) -> ThreadLifecycleResult:
+        """Async mirror of :meth:`Thread.delete`."""
+        return await self.memory.client.delete_thread(self.thread_id, hard=hard)
