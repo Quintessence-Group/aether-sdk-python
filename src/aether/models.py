@@ -69,6 +69,10 @@ class DocumentRecord:
     #: Indexed caption/transcript for a multimodal memory. Original media bytes
     #: remain available through ``download``.
     derived_text: Optional[str] = None
+    #: Summary request outcome when the insert asked for one (``summarize``):
+    #: ``"pending"`` (queued) or ``"skipped"`` (skipped by policy); ``None``
+    #: when no summary was requested. Poll ``get_summary`` for the result.
+    summary: Optional[str] = None
 
 
 @dataclass
@@ -270,6 +274,33 @@ class GroundingReceipt:
 
 
 @dataclass
+class MemoryFileHit:
+    """Where a search hit landed inside a memory file (``SearchResult.memory_file``)."""
+
+    #: The memory file's name, e.g. ``memory.md``.
+    name: str
+    #: The file version the hit was found in (always the current version).
+    version: int
+    #: Heading of the innermost section containing the match (best effort;
+    #: ``None`` when unknown or in the text before the first heading).
+    section: Optional[str] = None
+    #: Slug of that section, usable as a ``section`` selector.
+    section_slug: Optional[str] = None
+
+
+def parse_memory_file_hit(raw: Any) -> Optional[MemoryFileHit]:
+    """Map a search hit's optional ``memory_file`` object; ``None`` when absent."""
+    if not isinstance(raw, dict):
+        return None
+    return MemoryFileHit(
+        name=raw.get("name", ""),
+        version=int(raw.get("version") or 0),
+        section=raw.get("section"),
+        section_slug=raw.get("section_slug"),
+    )
+
+
+@dataclass
 class SearchResult:
     doc_id: str
     #: Calibrated relevance, 0-100 (higher = better); ~100 for a near-exact
@@ -307,6 +338,9 @@ class SearchResult:
     #: otherwise); pass it to ``send_search_feedback`` together with this
     #: hit's ``doc_id``.
     query_id: Optional[str] = None
+    #: Set when the hit is a memory file: its name, version and the section
+    #: the match falls in. ``None`` for every other document.
+    memory_file: Optional[MemoryFileHit] = None
 
 
 @dataclass
@@ -394,6 +428,505 @@ class RetrievalResult:
     updated_at: Optional[str] = None
     #: ``image`` or ``audio`` when this result is a multimodal memory.
     modality: Optional[str] = None
+    #: Set when the result is a memory file (see ``SearchResult.memory_file``).
+    memory_file: Optional[MemoryFileHit] = None
+
+
+@dataclass
+class MemoryFileSection:
+    """One section of a markdown outline: a top-level ATX heading and the
+    lines it spans. Line numbers are 1-based and inclusive; ``bytes`` counts
+    lines ``start_line..end_line`` including their line terminators."""
+
+    #: Heading text; ``""`` for a bare ``#``.
+    heading: str
+    #: Heading level, 1-6.
+    level: int
+    #: Slug, unique within the text — usable as a ``section`` selector.
+    slug: str
+    start_line: int
+    end_line: int
+    bytes: int
+
+
+@dataclass
+class DocumentText:
+    """Result of :meth:`AetherClient.get_text` (``GET /v1/documents/{id}/text``)."""
+
+    doc_id: str
+    content_type: str
+    #: ``original`` (a text document's own bytes), ``derived`` (a media
+    #: memory's caption/transcript) or ``passages`` (rebuilt from a parsed
+    #: document's passages, best effort); ``None`` when ``state`` is
+    #: ``unsupported``.
+    source: Optional[str]
+    #: ``ready``, or ``unsupported`` when the document has no readable text.
+    state: str
+    #: This page of the selected text (``""`` with ``outline=True``).
+    text: str
+    #: Byte offset of this page within the selected text.
+    offset: int = 0
+    #: Offset of the next page, or ``None`` on the last page.
+    next_offset: Optional[int] = None
+    #: UTF-8 byte length of the selected text (the whole text, or the section).
+    total_bytes: int = 0
+    #: ``True`` when more pages follow (``next_offset is not None``).
+    truncated: bool = False
+    #: The selected section when ``section`` was requested, else ``None``.
+    section: Optional[MemoryFileSection] = None
+    #: The text's outline when ``outline=True`` was requested, else ``None``.
+    sections: Optional[list[MemoryFileSection]] = None
+
+
+def _parse_memory_file_section(raw: dict[str, Any]) -> MemoryFileSection:
+    return MemoryFileSection(
+        heading=raw.get("heading", ""),
+        level=int(raw.get("level", 0)),
+        slug=raw.get("slug", ""),
+        start_line=int(raw.get("start_line", 0)),
+        end_line=int(raw.get("end_line", 0)),
+        bytes=int(raw.get("bytes", 0)),
+    )
+
+
+def parse_document_text(raw: dict[str, Any]) -> DocumentText:
+    """Map a ``/documents/{id}/text`` JSON body to a :class:`DocumentText`."""
+    section = raw.get("section")
+    sections = raw.get("sections")
+    return DocumentText(
+        doc_id=raw["doc_id"],
+        content_type=raw.get("content_type", ""),
+        source=raw.get("source"),
+        state=raw.get("state", "ready"),
+        text=raw.get("text", ""),
+        offset=int(raw.get("offset", 0)),
+        next_offset=raw.get("next_offset"),
+        total_bytes=int(raw.get("total_bytes", 0)),
+        truncated=bool(raw.get("truncated", False)),
+        section=_parse_memory_file_section(section) if section else None,
+        sections=(
+            [_parse_memory_file_section(s) for s in sections]
+            if sections is not None
+            else None
+        ),
+    )
+
+
+# ── Memory files ─────────────────────────────────────────────────────
+
+
+@dataclass
+class MemoryFileInfo:
+    """A memory file at one version: the item type of
+    :meth:`MemoryFiles.list` / :meth:`AetherClient.list_memory_files`, and the
+    fields every memory-file read and write result starts with.
+
+    A memory file is identified by ``(partition, entity_id, name)``. Its
+    ``version`` starts at 1 and grows by one with every change; it is not the
+    same counter as ``DocumentRecord.version``.
+    """
+
+    entity_id: str = ""
+    #: ``None`` for the default partition.
+    partition: Optional[str] = None
+    name: str = ""
+    #: Stable id of the file, kept across a soft delete and re-create (a hard
+    #: delete starts a new one).
+    file_id: str = ""
+    #: The document holding this version's content.
+    doc_id: str = ""
+    version: int = 0
+    #: Size of this version's content in bytes.
+    bytes: int = 0
+    #: Content hash of this version.
+    content_hash: str = ""
+    #: Free-text attribution label passed as ``author`` on the write, if any.
+    author: Optional[str] = None
+    #: Who wrote this version: the acting principal, or ``key:<prefix>``.
+    principal: str = ""
+    #: The write that produced this version: ``put``, ``append``,
+    #: ``append_section`` or ``replace_section``.
+    op: str = ""
+    #: RFC 3339 time the file was created (version 1 of its current lifetime).
+    created_at: str = ""
+    #: RFC 3339 time this version was written.
+    updated_at: str = ""
+
+
+@dataclass
+class MemoryFile(MemoryFileInfo):
+    """Result of :meth:`MemoryFiles.read`: one page of a memory file (the
+    whole file by default) plus its outline."""
+
+    #: ``False`` when an older ``version`` was requested.
+    is_current: bool = True
+    #: This page of the selected text (``""`` with ``outline=True``).
+    content: str = ""
+    #: The selected section when ``section`` was requested, else ``None``.
+    section: Optional[MemoryFileSection] = None
+    #: Byte offset of this page within the selected text.
+    offset: int = 0
+    #: Offset of the next page, or ``None`` on the last page.
+    next_offset: Optional[int] = None
+    #: UTF-8 byte length of the selected text (the whole version, or the
+    #: section).
+    total_bytes: int = 0
+    #: ``True`` when more pages follow (``next_offset is not None``).
+    truncated: bool = False
+    #: The whole version's outline, with whole-file line numbers.
+    sections: list[MemoryFileSection] = field(default_factory=list)
+
+
+@dataclass
+class MemoryFileWriteResult(MemoryFileInfo):
+    """Result of a memory-file write (``write``, ``append``,
+    ``append_section``, ``replace_section``). The info fields describe the
+    file's current version after the write."""
+
+    #: ``True`` when the write would not change the content, so nothing was
+    #: written and the info fields describe the existing current version.
+    unchanged: bool = False
+    #: The version this write replaced; ``None`` when it created the file.
+    previous_version: Optional[int] = None
+    #: ``True`` when this write created the file.
+    file_created: bool = False
+    #: Section writes: the affected section after the write, else ``None``.
+    section: Optional[MemoryFileSection] = None
+    #: Section writes: ``True`` when the section did not exist and was added.
+    section_created: bool = False
+    #: Outline of the resulting content.
+    sections: list[MemoryFileSection] = field(default_factory=list)
+
+
+@dataclass
+class MemoryFileVersion:
+    """One retained version in :class:`MemoryFileVersions`."""
+
+    doc_id: str = ""
+    version: int = 0
+    bytes: int = 0
+    content_hash: str = ""
+    author: Optional[str] = None
+    principal: str = ""
+    op: str = ""
+    updated_at: str = ""
+    is_current: bool = False
+
+
+@dataclass
+class MemoryFileVersions:
+    """Result of :meth:`MemoryFiles.versions`: retained versions, newest first."""
+
+    entity_id: str = ""
+    partition: Optional[str] = None
+    name: str = ""
+    file_id: str = ""
+    current_version: int = 0
+    versions: list[MemoryFileVersion] = field(default_factory=list)
+
+
+@dataclass
+class MemoryFileDiff:
+    """Result of :meth:`MemoryFiles.diff`: a line-based unified diff between
+    two versions (``from_version`` 0 is the empty file)."""
+
+    entity_id: str = ""
+    partition: Optional[str] = None
+    name: str = ""
+    file_id: str = ""
+    from_version: int = 0
+    to_version: int = 0
+    #: Lines of context around each change.
+    context: int = 0
+    #: Unified diff text (``--- name@vN`` / ``+++ name@vM`` headers).
+    diff: str = ""
+    added_lines: int = 0
+    removed_lines: int = 0
+    #: ``True`` when the diff is correct but possibly not minimal (the server
+    #: stopped optimizing it after its time budget).
+    approximate: bool = False
+    #: ``True`` when the diff text was cut at the server's output limit.
+    truncated: bool = False
+
+
+@dataclass
+class MemoryFilePage:
+    """One page of memory files; pass ``next_cursor`` back as ``cursor`` for
+    the next page (``None`` on the last page)."""
+
+    files: list[MemoryFileInfo] = field(default_factory=list)
+    next_cursor: Optional[str] = None
+
+
+@dataclass
+class MemoryGrepMatch:
+    """One matching line from a memory-file grep."""
+
+    entity_id: str = ""
+    partition: Optional[str] = None
+    name: str = ""
+    #: The file version that was searched (always the current version).
+    version: int = 0
+    #: 1-based line number of the match.
+    line: int = 0
+    #: Heading of the innermost section containing the line, or ``None``
+    #: before the first heading.
+    section: Optional[str] = None
+    section_slug: Optional[str] = None
+    #: The matching line, without its line terminator.
+    text: str = ""
+    #: Up to ``context`` lines before the match.
+    before: list[str] = field(default_factory=list)
+    #: Up to ``context`` lines after the match.
+    after: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MemoryGrepResult:
+    """Result of a memory-file grep."""
+
+    matches: list[MemoryGrepMatch] = field(default_factory=list)
+    #: ``True`` when the scan stopped at a limit before covering everything.
+    truncated: bool = False
+    #: Which limit stopped it: ``max_matches``, ``max_files``, ``max_bytes`` or
+    #: ``deadline``; ``None`` when not truncated.
+    truncated_reason: Optional[str] = None
+    files_scanned: int = 0
+    bytes_scanned: int = 0
+
+
+@dataclass
+class MemoryFileDeleteResult:
+    """Result of :meth:`MemoryFiles.delete`."""
+
+    entity_id: str = ""
+    partition: Optional[str] = None
+    name: str = ""
+    file_id: str = ""
+    #: The version that was current when the file was deleted.
+    version: int = 0
+    #: ``True`` for a hard delete (every version purged).
+    hard: bool = False
+    #: Number of versions removed: ``1`` for a soft delete.
+    versions_deleted: int = 0
+
+
+@dataclass
+class DocumentSummary:
+    """A document's summary and its state (:meth:`AetherClient.get_summary`,
+    ``put_summary``, ``regenerate_summary``).
+
+    ``state`` is one of ``none``, ``pending``, ``ready``, ``failed``,
+    ``skipped`` or ``unsupported``. ``content`` is independent of ``state``: a
+    stored summary stays readable while a regeneration is pending or after
+    one failed.
+    """
+
+    doc_id: str
+    state: str
+    #: Machine reason for ``skipped``, ``unsupported`` or ``failed``.
+    reason: Optional[str] = None
+    #: Human-readable message for ``failed``.
+    error: Optional[str] = None
+    #: The document that stores the summary, if any.
+    summary_doc_id: Optional[str] = None
+    #: The stored summary markdown, if any.
+    content: Optional[str] = None
+    #: Opaque revision of the stored summary; pass it as ``expected_revision``
+    #: to ``put_summary`` for a conditional write. Compare only for equality.
+    revision: Optional[str] = None
+    #: ``"aether"`` (generated) or ``"user"`` (written with ``put_summary``).
+    authored_by: Optional[str] = None
+    generator: Optional[str] = None
+    prompt_version: Optional[str] = None
+    #: RFC 3339 time the stored summary was written.
+    generated_at: Optional[str] = None
+    #: The document content id the summary was written against.
+    source_cid: Optional[str] = None
+    #: ``True`` when the document changed after the stored summary was written.
+    stale: bool = False
+    #: ``True`` when the document was too long and only its outline and
+    #: beginning were summarized.
+    truncated_input: bool = False
+
+
+def _int_field(raw: dict[str, Any], key: str, default: int = 0) -> int:
+    value = raw.get(key)
+    return int(value) if value is not None else default
+
+
+def _opt_int_field(raw: dict[str, Any], key: str) -> Optional[int]:
+    value = raw.get(key)
+    return int(value) if value is not None else None
+
+
+def _sections_field(raw: dict[str, Any]) -> list[MemoryFileSection]:
+    return [_parse_memory_file_section(s) for s in raw.get("sections") or []]
+
+
+def _section_field(raw: dict[str, Any]) -> Optional[MemoryFileSection]:
+    section = raw.get("section")
+    return _parse_memory_file_section(section) if section else None
+
+
+def _memory_file_info_fields(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "entity_id": raw.get("entity_id") or "",
+        "partition": raw.get("partition"),
+        "name": raw.get("name") or "",
+        "file_id": raw.get("file_id") or "",
+        "doc_id": raw.get("doc_id") or "",
+        "version": _int_field(raw, "version"),
+        "bytes": _int_field(raw, "bytes"),
+        "content_hash": raw.get("content_hash") or "",
+        "author": raw.get("author"),
+        "principal": raw.get("principal") or "",
+        "op": raw.get("op") or "",
+        "created_at": raw.get("created_at") or "",
+        "updated_at": raw.get("updated_at") or "",
+    }
+
+
+def parse_memory_file_info(raw: dict[str, Any]) -> MemoryFileInfo:
+    """Map a memory-file list item to a :class:`MemoryFileInfo`."""
+    return MemoryFileInfo(**_memory_file_info_fields(raw))
+
+
+def parse_memory_file(raw: dict[str, Any]) -> MemoryFile:
+    """Map a memory-file read body to a :class:`MemoryFile`."""
+    return MemoryFile(
+        **_memory_file_info_fields(raw),
+        is_current=bool(raw.get("is_current", True)),
+        content=raw.get("content") or "",
+        section=_section_field(raw),
+        offset=_int_field(raw, "offset"),
+        next_offset=_opt_int_field(raw, "next_offset"),
+        total_bytes=_int_field(raw, "total_bytes"),
+        truncated=bool(raw.get("truncated", False)),
+        sections=_sections_field(raw),
+    )
+
+
+def parse_memory_file_write_result(raw: dict[str, Any]) -> MemoryFileWriteResult:
+    """Map a memory-file write body to a :class:`MemoryFileWriteResult`."""
+    return MemoryFileWriteResult(
+        **_memory_file_info_fields(raw),
+        unchanged=bool(raw.get("unchanged", False)),
+        previous_version=_opt_int_field(raw, "previous_version"),
+        file_created=bool(raw.get("file_created", False)),
+        section=_section_field(raw),
+        section_created=bool(raw.get("section_created", False)),
+        sections=_sections_field(raw),
+    )
+
+
+def parse_memory_file_versions(raw: dict[str, Any]) -> MemoryFileVersions:
+    """Map a memory-file versions body to a :class:`MemoryFileVersions`."""
+    return MemoryFileVersions(
+        entity_id=raw.get("entity_id") or "",
+        partition=raw.get("partition"),
+        name=raw.get("name") or "",
+        file_id=raw.get("file_id") or "",
+        current_version=_int_field(raw, "current_version"),
+        versions=[
+            MemoryFileVersion(
+                doc_id=v.get("doc_id") or "",
+                version=_int_field(v, "version"),
+                bytes=_int_field(v, "bytes"),
+                content_hash=v.get("content_hash") or "",
+                author=v.get("author"),
+                principal=v.get("principal") or "",
+                op=v.get("op") or "",
+                updated_at=v.get("updated_at") or "",
+                is_current=bool(v.get("is_current", False)),
+            )
+            for v in raw.get("versions") or []
+        ],
+    )
+
+
+def parse_memory_file_diff(raw: dict[str, Any]) -> MemoryFileDiff:
+    """Map a memory-file diff body to a :class:`MemoryFileDiff`."""
+    return MemoryFileDiff(
+        entity_id=raw.get("entity_id") or "",
+        partition=raw.get("partition"),
+        name=raw.get("name") or "",
+        file_id=raw.get("file_id") or "",
+        from_version=_int_field(raw, "from_version"),
+        to_version=_int_field(raw, "to_version"),
+        context=_int_field(raw, "context"),
+        diff=raw.get("diff") or "",
+        added_lines=_int_field(raw, "added_lines"),
+        removed_lines=_int_field(raw, "removed_lines"),
+        approximate=bool(raw.get("approximate", False)),
+        truncated=bool(raw.get("truncated", False)),
+    )
+
+
+def parse_memory_file_page(raw: dict[str, Any]) -> MemoryFilePage:
+    """Map a memory-file list body to a :class:`MemoryFilePage`."""
+    return MemoryFilePage(
+        files=[parse_memory_file_info(f) for f in raw.get("files") or []],
+        next_cursor=raw.get("next_cursor"),
+    )
+
+
+def parse_memory_grep_result(raw: dict[str, Any]) -> MemoryGrepResult:
+    """Map a memory-file grep body to a :class:`MemoryGrepResult`."""
+    return MemoryGrepResult(
+        matches=[
+            MemoryGrepMatch(
+                entity_id=m.get("entity_id") or "",
+                partition=m.get("partition"),
+                name=m.get("name") or "",
+                version=_int_field(m, "version"),
+                line=_int_field(m, "line"),
+                section=m.get("section"),
+                section_slug=m.get("section_slug"),
+                text=m.get("text") or "",
+                before=list(m.get("before") or []),
+                after=list(m.get("after") or []),
+            )
+            for m in raw.get("matches") or []
+        ],
+        truncated=bool(raw.get("truncated", False)),
+        truncated_reason=raw.get("truncated_reason"),
+        files_scanned=_int_field(raw, "files_scanned"),
+        bytes_scanned=_int_field(raw, "bytes_scanned"),
+    )
+
+
+def parse_memory_file_delete_result(raw: dict[str, Any]) -> MemoryFileDeleteResult:
+    """Map a memory-file delete body to a :class:`MemoryFileDeleteResult`."""
+    return MemoryFileDeleteResult(
+        entity_id=raw.get("entity_id") or "",
+        partition=raw.get("partition"),
+        name=raw.get("name") or "",
+        file_id=raw.get("file_id") or "",
+        version=_int_field(raw, "version"),
+        hard=bool(raw.get("hard", False)),
+        versions_deleted=_int_field(raw, "versions_deleted"),
+    )
+
+
+def parse_document_summary(raw: dict[str, Any]) -> DocumentSummary:
+    """Map a ``/documents/{id}/summary`` body to a :class:`DocumentSummary`."""
+    return DocumentSummary(
+        doc_id=raw.get("doc_id") or "",
+        state=raw.get("state") or "none",
+        reason=raw.get("reason"),
+        error=raw.get("error"),
+        summary_doc_id=raw.get("summary_doc_id"),
+        content=raw.get("content"),
+        revision=raw.get("revision"),
+        authored_by=raw.get("authored_by"),
+        generator=raw.get("generator"),
+        prompt_version=raw.get("prompt_version"),
+        generated_at=raw.get("generated_at"),
+        source_cid=raw.get("source_cid"),
+        stale=bool(raw.get("stale", False)),
+        truncated_input=bool(raw.get("truncated_input", False)),
+    )
 
 
 class DocumentPage(list):
@@ -427,6 +960,10 @@ class BatchInsertItem:
     #: read it. ``None`` (default) leaves it unlabeled / tenant-visible; an
     #: explicit empty list quarantines it to admin-role keys only.
     acl_readers: Optional[list[str]] = None
+    #: Ask for (``True``) or opt out of (``False``) a generated summary for
+    #: this document, overriding the batch-level ``summarize``. ``None``
+    #: (default) sends nothing.
+    summarize: Optional[bool] = None
 
 @dataclass
 class BatchSearchQuery:

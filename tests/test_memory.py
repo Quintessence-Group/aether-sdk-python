@@ -423,8 +423,8 @@ class TestList:
     def test_newest_first_text_downloaded(self):
         # server returns filtered listing newest-first already
         docs = [
-            {"doc_id": "n1", "created_at": "2026-06-14T00:00:00Z", "entity_id": "user-42"},
-            {"doc_id": "n2", "created_at": "2026-06-10T00:00:00Z", "entity_id": "user-42"},
+            {"doc_id": "n1", "content_type": "text/plain", "created_at": "2026-06-14T00:00:00Z", "entity_id": "user-42"},
+            {"doc_id": "n2", "content_type": "text/plain", "created_at": "2026-06-10T00:00:00Z", "entity_id": "user-42"},
         ]
         routes = {
             ("GET", "/v1/documents"): _list_resp(docs),
@@ -587,7 +587,7 @@ class TestAsyncParity:
             assert item.score == pytest.approx(GOLDEN_BLENDED[item.id], abs=1e-6)
 
     async def test_list_text_downloaded(self):
-        docs = [{"doc_id": "n1", "created_at": "2026-06-14T00:00:00Z", "entity_id": "user-42"}]
+        docs = [{"doc_id": "n1", "content_type": "text/plain", "created_at": "2026-06-14T00:00:00Z", "entity_id": "user-42"}]
         routes = {
             ("GET", "/v1/documents"): _list_resp(docs),
             ("GET", "/v1/documents/n1/download"): _resp(content=b"hi"),

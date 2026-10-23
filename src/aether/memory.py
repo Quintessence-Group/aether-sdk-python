@@ -25,8 +25,10 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from .async_client import AsyncAetherClient
-from .client import AetherClient, _validate_thread_id
+from .async_client import _hydrate_document_text as _ahydrate_document_text
+from .client import AetherClient, _hydrate_document_text, _validate_thread_id
 from .errors import AetherError
+from .memory_files import AsyncMemoryFiles, MemoryFiles
 from .models import Metadata, MetadataFilter, ThreadLifecycleResult
 
 # Algorithm constants — see MEMORY_CONTRACT.md §4 Mode B. Identical across all
@@ -608,6 +610,7 @@ class _MemoryBase:
         *,
         half_life_days: float,
         extract_facts: bool,
+        summarize: Optional[bool],
         now: Callable[[], datetime],
     ) -> None:
         self.entity_id = _validate_entity_id(entity_id)
@@ -620,6 +623,10 @@ class _MemoryBase:
         # be configured on the node. The SDKs carry no LLM dependency — they
         # only pass the flag.
         self.extract_facts = extract_facts
+        # Default for a background summary of each text ``remember``: ``None``
+        # sends nothing (the tenant default applies); ``True`` / ``False`` is
+        # sent explicitly. A per-call ``summarize=`` overrides it.
+        self.summarize = summarize
         # Injectable clock — defaults to real UTC now; overridden in tests so the
         # recency-decay ordering is deterministic (contract §4).
         self.now: Callable[[], datetime] = now
@@ -692,6 +699,7 @@ class Memory(_MemoryBase):
         retry_base_delay: float = 0.5,
         half_life_days: float = 30.0,
         extract_facts: bool = False,
+        summarize: Optional[bool] = None,
         client: Optional[AetherClient] = None,
         now: Optional[Callable[[], datetime]] = None,
     ) -> None:
@@ -699,6 +707,7 @@ class Memory(_MemoryBase):
             entity_id,
             half_life_days=half_life_days,
             extract_facts=extract_facts,
+            summarize=summarize,
             now=now or _default_now,
         )
         if client is not None:
@@ -713,6 +722,13 @@ class Memory(_MemoryBase):
                 retry_base_delay=retry_base_delay,
             )
             self._owns_client = True
+        self._files = MemoryFiles(self)
+
+    @property
+    def files(self) -> MemoryFiles:
+        """This entity's memory files: named, versioned markdown files read
+        and edited whole or by section. See :class:`~aether.MemoryFiles`."""
+        return self._files
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -747,6 +763,7 @@ class Memory(_MemoryBase):
         content_type: Optional[str] = None,
         filename: Optional[str] = None,
         source: Optional[str] = None,
+        summarize: Optional[bool] = None,
     ) -> MemoryItem:
         """Store one memory for the entity (**one HTTP call**).
 
@@ -762,6 +779,11 @@ class Memory(_MemoryBase):
         :class:`MemoryItem` is the raw stored memory (not the facts); list the
         facts with ``kind="fact"`` on the underlying client. Requires fact
         extraction to be configured on the node.
+
+        Pass ``summarize=True`` to also have a summary generated in the
+        background (``False`` opts out); when omitted (``None``), the
+        constructor's ``summarize`` decides, and if that is ``None`` too the
+        tenant default applies. Read it with ``client.get_summary(item.id)``.
         """
         supplied = sum(value is not None for value in (text, image, audio))
         if supplied != 1:
@@ -769,6 +791,8 @@ class Memory(_MemoryBase):
         if image is not None or audio is not None:
             if extract is not None:
                 raise ValueError("extract is valid only for text memories")
+            if summarize is not None:
+                raise ValueError("summarize is valid only for text memories")
             modality = "image" if image is not None else "audio"
             if modality == "audio" and not transcribe and transcript is None:
                 raise ValueError("transcribe=False requires an explicit transcript")
@@ -813,6 +837,7 @@ class Memory(_MemoryBase):
             tags=tags,
             metadata=metadata,
             extract_facts=self.extract_facts if extract is None else extract,
+            summarize=self.summarize if summarize is None else summarize,
         )
         return MemoryItem(
             id=record.doc_id,
@@ -897,8 +922,13 @@ class Memory(_MemoryBase):
     ) -> list[MemoryItem]:
         """Chronological view of the entity's memories, **newest first**.
 
-        Cost note: this is **1 + N** calls (one listing plus one content
-        download per item). Callers who only need metadata can drop to the raw
+        Each memory's text is read by content type: text-like documents are
+        downloaded, other types (PDF, Office, ...) are read through
+        ``client.get_text`` (``""`` when no text is available), and media
+        memories use their caption/transcript.
+
+        Cost note: this is **1 + N** calls (one listing plus one content read
+        per non-media item). Callers who only need metadata can drop to the raw
         ``client.list(entity_id=...)``.
         """
         records = self.client.list(
@@ -913,7 +943,9 @@ class Memory(_MemoryBase):
             text = (
                 r.derived_text
                 if r.modality and r.derived_text is not None
-                else self.client.download_text(r.doc_id)
+                else _hydrate_document_text(
+                    self.client, r.doc_id, r.content_type, r.derived_text or ""
+                )
             )
             items.append(
                 MemoryItem(
@@ -1148,6 +1180,7 @@ class AsyncMemory(_MemoryBase):
         retry_base_delay: float = 0.5,
         half_life_days: float = 30.0,
         extract_facts: bool = False,
+        summarize: Optional[bool] = None,
         client: Optional[AsyncAetherClient] = None,
         now: Optional[Callable[[], datetime]] = None,
     ) -> None:
@@ -1155,6 +1188,7 @@ class AsyncMemory(_MemoryBase):
             entity_id,
             half_life_days=half_life_days,
             extract_facts=extract_facts,
+            summarize=summarize,
             now=now or _default_now,
         )
         if client is not None:
@@ -1169,6 +1203,13 @@ class AsyncMemory(_MemoryBase):
                 retry_base_delay=retry_base_delay,
             )
             self._owns_client = True
+        self._files = AsyncMemoryFiles(self)
+
+    @property
+    def files(self) -> AsyncMemoryFiles:
+        """This entity's memory files (async). See
+        :class:`~aether.AsyncMemoryFiles`."""
+        return self._files
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -1203,17 +1244,21 @@ class AsyncMemory(_MemoryBase):
         content_type: Optional[str] = None,
         filename: Optional[str] = None,
         source: Optional[str] = None,
+        summarize: Optional[bool] = None,
     ) -> MemoryItem:
         """Store one memory for the entity (**one HTTP call**). See
         :meth:`Memory.remember`. Pass ``extract=True`` to also distill atomic
         facts server-side; when omitted, the constructor's
-        ``extract_facts`` flag decides."""
+        ``extract_facts`` flag decides. ``summarize`` follows the same
+        per-call-over-constructor rule."""
         supplied = sum(value is not None for value in (text, image, audio))
         if supplied != 1:
             raise ValueError("provide exactly one of text, image, or audio")
         if image is not None or audio is not None:
             if extract is not None:
                 raise ValueError("extract is valid only for text memories")
+            if summarize is not None:
+                raise ValueError("summarize is valid only for text memories")
             modality = "image" if image is not None else "audio"
             if modality == "audio" and not transcribe and transcript is None:
                 raise ValueError("transcribe=False requires an explicit transcript")
@@ -1259,6 +1304,7 @@ class AsyncMemory(_MemoryBase):
             tags=tags,
             metadata=metadata,
             extract_facts=self.extract_facts if extract is None else extract,
+            summarize=self.summarize if summarize is None else summarize,
         )
         return MemoryItem(
             id=record.doc_id,
@@ -1356,7 +1402,9 @@ class AsyncMemory(_MemoryBase):
         async def content_for(record):
             if record.modality and record.derived_text is not None:
                 return record.derived_text
-            return await self.client.download_text(record.doc_id)
+            return await _ahydrate_document_text(
+                self.client, record.doc_id, record.content_type, record.derived_text or ""
+            )
 
         texts = await asyncio.gather(*(content_for(r) for r in records))
         return [

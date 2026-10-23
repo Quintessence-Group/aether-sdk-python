@@ -5,6 +5,19 @@ All notable changes to the `aether-ai` Python SDK are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0]
+
+### Added
+
+- Versioned Markdown memory files: read, write, append, edit sections, list versions, diff, grep, and delete.
+- Readable document text and document summaries, including optional summaries at ingest.
+- Typed memory version conflicts, write preconditions, and retry-safe memory writes.
+
+### Fixed
+
+- Retrieve readable text for PDF and Office documents instead of decoding their original binary bytes.
+
+
 ## [0.6.0]
 
 ### Added

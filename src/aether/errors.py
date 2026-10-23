@@ -102,6 +102,44 @@ class PartitionMismatchError(AetherApiError):
     """
 
 
+class VersionConflictError(AetherApiError):
+    """Raised when a memory-file write or delete carried a version
+    precondition that no longer holds (HTTP 412,
+    ``code="memory_file_version_conflict"``): the file changed since you read
+    it, it does not exist (``expected_version`` on a missing file), or it
+    already exists (``create=True``).
+
+    ``current_version`` is the file's current version, or ``None`` when no
+    file exists. Re-read the file, re-apply your edit and write again with
+    the new version. Not retryable as-is.
+
+    Attributes:
+        current_version: The current version reported by the server, or
+            ``None``.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        error_code: Optional[str] = None,
+        request_id: Optional[str] = None,
+        body: Optional[dict[str, Any]] = None,
+    ):
+        super().__init__(
+            status_code,
+            message,
+            error_code=error_code,
+            request_id=request_id,
+            body=body,
+        )
+        current = self.body.get("current_version") if isinstance(self.body, dict) else None
+        self.current_version: Optional[int] = (
+            current if isinstance(current, int) and not isinstance(current, bool) else None
+        )
+
+
 def aether_api_error_from_response(
     status_code: int,
     message: str,
@@ -128,6 +166,8 @@ def aether_api_error_from_response(
         cls = SessionInvalidError
     elif status_code == 400 and error_code == "partition_mismatch":
         cls = PartitionMismatchError
+    elif status_code == 412 and error_code == "memory_file_version_conflict":
+        cls = VersionConflictError
     else:
         cls = AetherApiError
     return cls(
