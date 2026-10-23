@@ -15,7 +15,13 @@ from urllib.parse import quote
 
 import httpx
 
-from ._internal import USER_AGENT, enforce_secure_base_url, new_idempotency_key
+from ._internal import (
+    MAX_TEXT_PAGE_BYTES,
+    USER_AGENT,
+    enforce_secure_base_url,
+    is_text_like_content_type,
+    new_idempotency_key,
+)
 from .errors import AetherApiError, AetherError, AetherNetworkError, aether_api_error_from_response
 from .schema import SchemaClient
 
@@ -189,7 +195,11 @@ from .models import (
     DisconnectResult,
     DocumentPage,
     DocumentRecord,
+    DocumentSummary,
+    DocumentText,
     ConversationThread,
+    MemoryFilePage,
+    MemoryGrepResult,
     PurgeSummary,
     ThreadLifecycleResult,
     QueryGroup,
@@ -215,7 +225,42 @@ from .models import (
     SearchTrace,
     ShareableReceipt,
     TracedSearch,
+    parse_document_summary,
+    parse_document_text,
+    parse_memory_file_hit,
 )
+from .memory_files import _execute, _grep_files_call, _list_files_call
+
+
+def _summarize_param(summarize: Optional[bool]) -> str:
+    """The ``&summarize=`` query suffix: empty when unset (the tenant default
+    applies), else an explicit ``true`` / ``false``."""
+    if summarize is None:
+        return ""
+    return "&summarize=true" if summarize else "&summarize=false"
+
+
+def _hydrate_document_text(
+    client: "AetherClient", doc_id: str, content_type: Optional[str], fallback: str
+) -> str:
+    """Read a non-media document's text for ``retrieve`` / ``Memory.recall`` /
+    ``Memory.list``.
+
+    Text-like types are downloaded and decoded; any other type goes through
+    ``GET /v1/documents/{id}/text`` (up to 1 MiB). When that text is
+    unavailable (``state == "unsupported"``) or the server answers 404 (an
+    older server, or the document vanished), *fallback* is returned. Other
+    errors propagate.
+    """
+    if is_text_like_content_type(content_type):
+        return client.download_text(doc_id)
+    try:
+        text = client.get_text(doc_id, max_bytes=MAX_TEXT_PAGE_BYTES)
+    except AetherApiError as exc:
+        if exc.status_code == 404:
+            return fallback
+        raise
+    return text.text if text.state == "ready" else fallback
 
 
 class AetherClient:
@@ -506,6 +551,7 @@ class AetherClient:
             metadata=dict(d.get("metadata") or {}),
             modality=d.get("modality"),
             derived_text=d.get("derived_text"),
+            summary=d.get("summary"),
         )
 
     @staticmethod
@@ -658,6 +704,7 @@ class AetherClient:
         source: str | None = None,
         metadata: Metadata | None = None,
         acl_readers: list[str] | None = None,
+        summarize: bool | None = None,
     ) -> DocumentRecord:
         """Insert a document from a file path.
 
@@ -677,6 +724,12 @@ class AetherClient:
         via :meth:`as_principal`; admin-role keys bypass). Omit (``None``) to
         leave the document unlabeled — readable tenant-wide, the default. An
         explicit empty list quarantines the document to admin-role keys only.
+
+        Pass ``summarize=True`` to have a summary generated in the background
+        after the insert commits (``False`` opts out of a tenant default;
+        ``None`` leaves the tenant default in charge). It never fails or
+        delays the insert: the returned record's ``summary`` is ``"pending"``
+        or ``"skipped"``, and :meth:`get_summary` reads the result.
         """
         if chunk_size is not None and chunk_size < 1:
             raise ValueError("chunk_size must be at least 1")
@@ -701,6 +754,7 @@ class AetherClient:
             url += f"&source={quote(source)}"
         if metadata is not None:
             url += f"&metadata={quote(_json_query_value(metadata))}"
+        url += _summarize_param(summarize)
         acl_param = _acl_readers_param(acl_readers)
         if acl_param is not None:
             url += f"&acl_readers={quote(acl_param)}"
@@ -850,6 +904,7 @@ class AetherClient:
         metadata: Metadata | None = None,
         extract_facts: bool = False,
         acl_readers: list[str] | None = None,
+        summarize: bool | None = None,
     ) -> DocumentRecord:
         """Insert raw text content.
 
@@ -867,6 +922,9 @@ class AetherClient:
         Pass *acl_readers* to set the document's read-ACL — see :meth:`insert`
         (omit to leave the document unlabeled / tenant-visible; an explicit
         empty list quarantines it to admin-role keys).
+
+        Pass ``summarize=True`` / ``False`` to request or opt out of a
+        background summary — see :meth:`insert`.
         """
         if chunk_size is not None and chunk_size < 1:
             raise ValueError("chunk_size must be at least 1")
@@ -887,6 +945,7 @@ class AetherClient:
             url += f"&metadata={quote(_json_query_value(metadata))}"
         if extract_facts:
             url += "&extract_facts=true"
+        url += _summarize_param(summarize)
         acl_param = _acl_readers_param(acl_readers)
         if acl_param is not None:
             url += f"&acl_readers={quote(acl_param)}"
@@ -1162,6 +1221,7 @@ class AetherClient:
         source: str | None = None,
         metadata: Metadata | None = None,
         acl_readers: list[str] | None = None,
+        summarize: bool | None = None,
     ) -> DocumentRecord:
         """Insert a document from a file-like object or iterator without loading everything into memory.
 
@@ -1175,6 +1235,9 @@ class AetherClient:
         channel name) for later filtering on search and list.
 
         Pass *acl_readers* to set the document's read-ACL — see :meth:`insert`.
+
+        Pass ``summarize=True`` / ``False`` to request or opt out of a
+        background summary — see :meth:`insert`.
 
         Note: streaming uploads bypass the retry wrapper because the stream
         may not be re-readable. Ensure the stream is seekable if you need retries.
@@ -1196,6 +1259,7 @@ class AetherClient:
             url += f"&source={quote(source)}"
         if metadata is not None:
             url += f"&metadata={quote(_json_query_value(metadata))}"
+        url += _summarize_param(summarize)
         acl_param = _acl_readers_param(acl_readers)
         if acl_param is not None:
             url += f"&acl_readers={quote(acl_param)}"
@@ -1364,6 +1428,224 @@ class AetherClient:
         self._raise_for_status(resp)
         return resp.content.decode("utf-8")
 
+    def get_text(
+        self,
+        doc_id: str,
+        *,
+        section: Optional[str] = None,
+        outline: bool = False,
+        offset: Optional[int] = None,
+        max_bytes: Optional[int] = None,
+    ) -> DocumentText:
+        """Read a document's text, paged and addressable by section.
+
+        Returns the original for text documents, the caption or transcript for
+        media, and text rebuilt from the parsed passages for PDF, Office and
+        other parsed types. Pass ``next_offset`` back as *offset* while
+        ``truncated``. *section* narrows the text to one markdown section (by
+        heading text or slug); ``outline=True`` returns only ``sections``. A
+        document with no readable text comes back with
+        ``state == "unsupported"``.
+
+        On a partition handle the partition is sent as a guard: a document in
+        a different partition returns the same 404 as a nonexistent one.
+
+        Raises:
+            ValueError: *doc_id* is empty.
+            AetherApiError: 404 (not found, or no matching section), 409
+                (ambiguous section), 400 (invalid options).
+        """
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        params: dict[str, Any] = {}
+        if section is not None:
+            params["section"] = section
+        if outline:
+            params["outline"] = "true"
+        if offset is not None:
+            params["offset"] = offset
+        if max_bytes is not None:
+            params["max_bytes"] = max_bytes
+        if self._partition:
+            params["partition"] = self._partition
+        resp = self._request_with_retry(
+            "GET", f"/documents/{quote(doc_id)}/text", params=params or None
+        )
+        self._raise_for_status(resp)
+        return parse_document_text(resp.json())
+
+    # ── Document summaries ────────────────────────────────────────────
+
+    def get_summary(self, doc_id: str) -> DocumentSummary:
+        """Read a document's summary and its state.
+
+        Always answers for a visible document: ``state`` is ``none``,
+        ``pending``, ``ready``, ``failed``, ``skipped`` or ``unsupported``, and
+        ``content`` holds any stored summary (it stays readable while a
+        regeneration is pending). ``stale`` is ``True`` when the document
+        changed after the summary was written.
+
+        On a partition handle the partition is sent as a guard, as for
+        :meth:`get_text`.
+
+        Raises:
+            ValueError: *doc_id* is empty.
+            AetherApiError: 404 (``document_not_found``, or
+                ``feature_not_enabled`` when summaries are not enabled on your
+                deployment).
+        """
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        params: dict[str, Any] = {}
+        if self._partition:
+            params["partition"] = self._partition
+        resp = self._request_with_retry(
+            "GET", f"/documents/{quote(doc_id)}/summary", params=params or None
+        )
+        self._raise_for_status(resp)
+        return parse_document_summary(resp.json())
+
+    def put_summary(
+        self,
+        doc_id: str,
+        content: str,
+        *,
+        expected_revision: Optional[str] = None,
+    ) -> DocumentSummary:
+        """Store your own summary for a document (``authored_by == "user"``),
+        replacing any stored one. *content* is markdown, up to 16 KiB.
+
+        Pass *expected_revision* (a previous ``revision``) to write only if the
+        stored summary is still that revision. A user-written summary is never
+        replaced by a regeneration unless that regeneration is forced.
+
+        Raises:
+            ValueError: *doc_id* or *expected_revision* is empty.
+            AetherApiError: 412 ``summary_revision_conflict`` (with
+                ``body["current_revision"]``), 413 ``summary_too_large``, 422
+                ``summary_unsupported``.
+        """
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        if expected_revision is not None and not expected_revision:
+            raise ValueError("expected_revision cannot be empty")
+        headers: dict[str, str] = {}
+        if expected_revision is not None:
+            headers["If-Match"] = f'"{expected_revision}"'
+        params: dict[str, Any] = {}
+        if self._partition:
+            params["partition"] = self._partition
+        resp = self._request_with_retry(
+            "PUT",
+            f"/documents/{quote(doc_id)}/summary",
+            params=params or None,
+            json={"content": content},
+            headers=headers or None,
+        )
+        self._raise_for_status(resp)
+        return parse_document_summary(resp.json())
+
+    def regenerate_summary(self, doc_id: str, *, force: bool = False) -> DocumentSummary:
+        """Queue a fresh generated summary for a document.
+
+        Returns at once with ``state == "pending"`` (joining a generation
+        already in flight); poll :meth:`get_summary` for the result. A stored
+        user-written summary is only replaced with ``force=True``.
+
+        Raises:
+            ValueError: *doc_id* is empty.
+            AetherApiError: 409 ``summary_user_authored`` (pass
+                ``force=True``), 422 ``summarizer_not_configured`` /
+                ``summary_unsupported``.
+        """
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        params: dict[str, Any] = {}
+        if force:
+            params["force"] = "true"
+        if self._partition:
+            params["partition"] = self._partition
+        resp = self._request_with_retry(
+            "POST", f"/documents/{quote(doc_id)}/summary", params=params or None
+        )
+        self._raise_for_status(resp)
+        return parse_document_summary(resp.json())
+
+    # ── Memory files (cross-entity) ───────────────────────────────────
+
+    def list_memory_files(
+        self,
+        *,
+        entity_id: Optional[str] = None,
+        entity_prefix: Optional[str] = None,
+        prefix: Optional[str] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> MemoryFilePage:
+        """List current memory files across entities.
+
+        *entity_id* lists one entity's files; *entity_prefix* lists every
+        entity whose id starts with it (for example
+        ``"scoped:ws_42:company:"``); with neither, every memory file in scope
+        is listed. *prefix* filters file names. Pass ``next_cursor`` back as
+        *cursor* for the next page. For one entity, ``Memory(...).files`` is
+        the simpler handle. A multi-tenant key needs a partition handle.
+
+        Raises:
+            ValueError: both *entity_id* and *entity_prefix* are given.
+            AetherApiError: 404 ``feature_not_enabled`` when memory files are
+                not enabled on your deployment.
+        """
+        return _execute(
+            self,
+            _list_files_call(
+                entity_id=entity_id,
+                entity_prefix=entity_prefix,
+                prefix=prefix,
+                limit=limit,
+                cursor=cursor,
+            ),
+        )
+
+    def grep_memory_files(
+        self,
+        pattern: str,
+        *,
+        entity_id: Optional[str] = None,
+        entity_prefix: Optional[str] = None,
+        regex: bool = False,
+        ignore_case: bool = False,
+        files: Optional[list[str]] = None,
+        context: int = 0,
+        max_matches: int = 100,
+    ) -> MemoryGrepResult:
+        """Search the current version of memory files line by line, across
+        entities.
+
+        Scope with *entity_id* or *entity_prefix* (at most one; neither scans
+        every memory file in scope). See :meth:`MemoryFiles.grep` for
+        *pattern*, *regex*, *ignore_case*, *files*, *context* and
+        *max_matches*.
+
+        Raises:
+            ValueError: empty *pattern*, or both *entity_id* and
+                *entity_prefix* are given.
+            AetherApiError: 400 ``invalid_pattern``.
+        """
+        return _execute(
+            self,
+            _grep_files_call(
+                pattern,
+                entity_id=entity_id,
+                entity_prefix=entity_prefix,
+                regex=regex,
+                ignore_case=ignore_case,
+                files=files,
+                context=context,
+                max_matches=max_matches,
+            ),
+        )
+
     def retrieve(
         self,
         query: str,
@@ -1386,9 +1668,11 @@ class AetherClient:
     ) -> list[RetrievalResult]:
         """Search and return results with document content included.
 
-        Combines search() + download_text() into a single call for RAG workflows.
-        Results are deduplicated by doc_id (best score wins).
-        Uses server-side include_content when available, falling back to per-doc downloads.
+        Combines search() with a per-document text read into a single call for
+        RAG workflows. Results are deduplicated by doc_id (best score wins).
+        Text-like documents are downloaded and decoded; other types (PDF,
+        Office, HTML, CSV, ...) are read through get_text(), falling back to the
+        matched passage; media hits use their caption/transcript passage.
 
         The *entity_id*, *since*, *until*, *last_n_days*, *max_distance*,
         *any_tags*, *content_types*, *sources*, *recency_weight*,
@@ -1442,8 +1726,14 @@ class AetherClient:
                             f"media result {r.doc_id} has no derived_text"
                         )
                     content = record.derived_text
+            elif r.content is not None:
+                content = r.content
             else:
-                content = r.content if r.content is not None else self.download_text(r.doc_id)
+                # Never decode a binary original: non-text types go through
+                # /text, falling back to the matched passage.
+                content = _hydrate_document_text(
+                    self, r.doc_id, r.content_type, r.passage if r.passage is not None else ""
+                )
             retrieval_results.append(
                 RetrievalResult(
                     doc_id=r.doc_id,
@@ -1462,6 +1752,7 @@ class AetherClient:
                     created_at=r.created_at,
                     updated_at=r.updated_at,
                     modality=r.modality,
+                    memory_file=r.memory_file,
                 )
             )
         return retrieval_results
@@ -1874,6 +2165,7 @@ class AetherClient:
             updated_at=r.get("updated_at"),
             modality=r.get("modality"),
             query_id=query_id,
+            memory_file=parse_memory_file_hit(r.get("memory_file")),
         )
 
     def send_search_feedback(self, query_id: str, doc_id: str, signal: str) -> None:
@@ -2397,6 +2689,7 @@ class AetherClient:
         source: str | None = None,
         metadata: Metadata | None = None,
         acl_readers: list[str] | None = None,
+        summarize: bool | None = None,
     ) -> dict:
         """Enqueue a document for asynchronous processing.
         Returns a dict with: job_id, status, poll_url.
@@ -2408,6 +2701,10 @@ class AetherClient:
         channel name) for later filtering on search and list.
 
         Pass *acl_readers* to set the document's read-ACL — see :meth:`insert`.
+
+        Pass ``summarize=True`` / ``False`` to request or opt out of a
+        background summary — see :meth:`insert`. The completed job (see
+        :meth:`wait_for_job`) then reports ``summary_state``.
         """
         path = Path(file_path)
         data = path.read_bytes()
@@ -2428,6 +2725,7 @@ class AetherClient:
             url += f"&source={quote(source)}"
         if metadata is not None:
             url += f"&metadata={quote(_json_query_value(metadata))}"
+        url += _summarize_param(summarize)
         acl_param = _acl_readers_param(acl_readers)
         if acl_param is not None:
             url += f"&acl_readers={quote(acl_param)}"
@@ -2439,7 +2737,12 @@ class AetherClient:
         return resp.json()
 
     def wait_for_job(self, job_id: str, timeout: float = 60.0, poll_interval: float = 1.0) -> dict:
-        """Wait for a background document job to complete."""
+        """Wait for a background document job to complete.
+
+        Returns the job status dict. When the insert requested a summary, a
+        completed job also carries ``summary_state`` (``"pending"`` or
+        ``"skipped"``).
+        """
         if not job_id:
             raise ValueError("job_id cannot be empty")
         start = time.time()
@@ -2460,12 +2763,17 @@ class AetherClient:
         documents: list[BatchInsertItem],
         chunk_size: int | None = None,
         overlap: int | None = None,
+        summarize: bool | None = None,
     ) -> list[DocumentRecord]:
         """Insert multiple text documents in a single batch request.
 
         Each item may carry its own ``acl_readers`` read-ACL, with the same
         semantics as :meth:`insert` (omitted -> unlabeled; empty list ->
         admin-only quarantine).
+
+        *summarize* requests (``True``) or opts out of (``False``) background
+        summaries for the whole batch — see :meth:`insert`; an item's own
+        ``summarize`` overrides it.
         """
         if not documents:
             raise ValueError("documents cannot be empty")
@@ -2483,6 +2791,7 @@ class AetherClient:
                         if d.acl_readers is not None
                         else {}
                     ),
+                    **({"summarize": bool(d.summarize)} if d.summarize is not None else {}),
                     **({"partition": self._partition} if self._partition else {}),
                 }
                 for d in documents
@@ -2492,6 +2801,8 @@ class AetherClient:
             payload["chunk_size"] = chunk_size
         if overlap is not None:
             payload["overlap"] = overlap
+        if summarize is not None:
+            payload["summarize"] = bool(summarize)
 
         resp = self._request_with_retry("POST", "/documents/batch", json=payload)
         self._raise_for_status(resp)

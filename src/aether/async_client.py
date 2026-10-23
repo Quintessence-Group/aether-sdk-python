@@ -16,12 +16,19 @@ from urllib.parse import quote
 
 import httpx
 
-from ._internal import USER_AGENT, enforce_secure_base_url, new_idempotency_key
+from ._internal import (
+    MAX_TEXT_PAGE_BYTES,
+    USER_AGENT,
+    enforce_secure_base_url,
+    is_text_like_content_type,
+    new_idempotency_key,
+)
 from .audit import AsyncAuditClient
 from .client import (
     AetherClient,
     _acl_readers_param,
     _clean_groups,
+    _summarize_param,
     _validate_acl_readers,
     _validate_partition,
     _validate_principal,
@@ -47,7 +54,11 @@ from .models import (
     DisconnectResult,
     DocumentPage,
     DocumentRecord,
+    DocumentSummary,
+    DocumentText,
     ConversationThread,
+    MemoryFilePage,
+    MemoryGrepResult,
     PurgeSummary,
     ThreadLifecycleResult,
     QueryGroup,
@@ -66,12 +77,33 @@ from .models import (
     SearchResult,
     SearchTrace,
     TracedSearch,
+    parse_document_summary,
+    parse_document_text,
+    parse_memory_file_hit,
     resolve_content_type,
 )
+from .memory_files import _aexecute, _grep_files_call, _list_files_call
 
 
 def _json_query_value(value: object) -> str:
     return json.dumps(value, separators=(",", ":"))
+
+
+async def _hydrate_document_text(
+    client: "AsyncAetherClient", doc_id: str, content_type: Optional[str], fallback: str
+) -> str:
+    """Async twin of :func:`aether.client._hydrate_document_text`: text-like
+    types are downloaded, anything else is read through ``/text`` (up to
+    1 MiB), and an ``unsupported`` state or a 404 returns *fallback*."""
+    if is_text_like_content_type(content_type):
+        return await client.download_text(doc_id)
+    try:
+        text = await client.get_text(doc_id, max_bytes=MAX_TEXT_PAGE_BYTES)
+    except AetherApiError as exc:
+        if exc.status_code == 404:
+            return fallback
+        raise
+    return text.text if text.state == "ready" else fallback
 
 
 class AsyncAetherClient:
@@ -348,6 +380,7 @@ class AsyncAetherClient:
             metadata=dict(d.get("metadata") or {}),
             modality=d.get("modality"),
             derived_text=d.get("derived_text"),
+            summary=d.get("summary"),
         )
 
     @staticmethod
@@ -385,6 +418,7 @@ class AsyncAetherClient:
         source: str | None = None,
         metadata: Metadata | None = None,
         acl_readers: list[str] | None = None,
+        summarize: bool | None = None,
     ) -> DocumentRecord:
         """Insert a document from a file path.
 
@@ -402,6 +436,9 @@ class AsyncAetherClient:
         :meth:`AetherClient.insert` (omit to leave the document unlabeled /
         tenant-visible; an explicit empty list quarantines it to admin-role
         keys).
+
+        Pass ``summarize=True`` / ``False`` to request or opt out of a
+        background summary — see :meth:`AetherClient.insert`.
         """
         if chunk_size is not None and chunk_size < 1:
             raise ValueError("chunk_size must be at least 1")
@@ -426,6 +463,7 @@ class AsyncAetherClient:
             url += f"&source={quote(source)}"
         if metadata is not None:
             url += f"&metadata={quote(_json_query_value(metadata))}"
+        url += _summarize_param(summarize)
         acl_param = _acl_readers_param(acl_readers)
         if acl_param is not None:
             url += f"&acl_readers={quote(acl_param)}"
@@ -553,6 +591,7 @@ class AsyncAetherClient:
         metadata: Metadata | None = None,
         extract_facts: bool = False,
         acl_readers: list[str] | None = None,
+        summarize: bool | None = None,
     ) -> DocumentRecord:
         """Insert raw text content.
 
@@ -569,6 +608,9 @@ class AsyncAetherClient:
 
         Pass *acl_readers* to set the document's read-ACL — see
         :meth:`AetherClient.insert`.
+
+        Pass ``summarize=True`` / ``False`` to request or opt out of a
+        background summary — see :meth:`AetherClient.insert`.
         """
         if chunk_size is not None and chunk_size < 1:
             raise ValueError("chunk_size must be at least 1")
@@ -589,6 +631,7 @@ class AsyncAetherClient:
             url += f"&metadata={quote(_json_query_value(metadata))}"
         if extract_facts:
             url += "&extract_facts=true"
+        url += _summarize_param(summarize)
         acl_param = _acl_readers_param(acl_readers)
         if acl_param is not None:
             url += f"&acl_readers={quote(acl_param)}"
@@ -809,6 +852,7 @@ class AsyncAetherClient:
         source: str | None = None,
         metadata: Metadata | None = None,
         acl_readers: list[str] | None = None,
+        summarize: bool | None = None,
     ) -> DocumentRecord:
         """Insert a document from a file-like object or async iterator without loading everything into memory.
 
@@ -823,6 +867,9 @@ class AsyncAetherClient:
 
         Pass *acl_readers* to set the document's read-ACL — see
         :meth:`AetherClient.insert`.
+
+        Pass ``summarize=True`` / ``False`` to request or opt out of a
+        background summary — see :meth:`AetherClient.insert`.
 
         Note: streaming uploads bypass the retry wrapper because the stream
         may not be re-readable. Ensure the stream is seekable if you need retries.
@@ -844,6 +891,7 @@ class AsyncAetherClient:
             url += f"&source={quote(source)}"
         if metadata is not None:
             url += f"&metadata={quote(_json_query_value(metadata))}"
+        url += _summarize_param(summarize)
         acl_param = _acl_readers_param(acl_readers)
         if acl_param is not None:
             url += f"&acl_readers={quote(acl_param)}"
@@ -1001,6 +1049,149 @@ class AsyncAetherClient:
         )
         self._raise_for_status(resp)
         return resp.content.decode("utf-8")
+
+    async def get_text(
+        self,
+        doc_id: str,
+        *,
+        section: Optional[str] = None,
+        outline: bool = False,
+        offset: Optional[int] = None,
+        max_bytes: Optional[int] = None,
+    ) -> DocumentText:
+        """Read a document's text, paged and addressable by section. See
+        :meth:`AetherClient.get_text`."""
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        params: dict[str, Any] = {}
+        if section is not None:
+            params["section"] = section
+        if outline:
+            params["outline"] = "true"
+        if offset is not None:
+            params["offset"] = offset
+        if max_bytes is not None:
+            params["max_bytes"] = max_bytes
+        if self._partition:
+            params["partition"] = self._partition
+        resp = await self._request_with_retry(
+            "GET", f"/documents/{quote(doc_id)}/text", params=params or None
+        )
+        self._raise_for_status(resp)
+        return parse_document_text(resp.json())
+
+    # ── Document summaries ────────────────────────────────────────────
+
+    async def get_summary(self, doc_id: str) -> DocumentSummary:
+        """Read a document's summary and its state. See
+        :meth:`AetherClient.get_summary`."""
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        params: dict[str, Any] = {}
+        if self._partition:
+            params["partition"] = self._partition
+        resp = await self._request_with_retry(
+            "GET", f"/documents/{quote(doc_id)}/summary", params=params or None
+        )
+        self._raise_for_status(resp)
+        return parse_document_summary(resp.json())
+
+    async def put_summary(
+        self,
+        doc_id: str,
+        content: str,
+        *,
+        expected_revision: Optional[str] = None,
+    ) -> DocumentSummary:
+        """Store your own summary for a document. See
+        :meth:`AetherClient.put_summary`."""
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        if expected_revision is not None and not expected_revision:
+            raise ValueError("expected_revision cannot be empty")
+        headers: dict[str, str] = {}
+        if expected_revision is not None:
+            headers["If-Match"] = f'"{expected_revision}"'
+        params: dict[str, Any] = {}
+        if self._partition:
+            params["partition"] = self._partition
+        resp = await self._request_with_retry(
+            "PUT",
+            f"/documents/{quote(doc_id)}/summary",
+            params=params or None,
+            json={"content": content},
+            headers=headers or None,
+        )
+        self._raise_for_status(resp)
+        return parse_document_summary(resp.json())
+
+    async def regenerate_summary(self, doc_id: str, *, force: bool = False) -> DocumentSummary:
+        """Queue a fresh generated summary for a document. See
+        :meth:`AetherClient.regenerate_summary`."""
+        if not doc_id:
+            raise ValueError("doc_id cannot be empty")
+        params: dict[str, Any] = {}
+        if force:
+            params["force"] = "true"
+        if self._partition:
+            params["partition"] = self._partition
+        resp = await self._request_with_retry(
+            "POST", f"/documents/{quote(doc_id)}/summary", params=params or None
+        )
+        self._raise_for_status(resp)
+        return parse_document_summary(resp.json())
+
+    # ── Memory files (cross-entity) ───────────────────────────────────
+
+    async def list_memory_files(
+        self,
+        *,
+        entity_id: Optional[str] = None,
+        entity_prefix: Optional[str] = None,
+        prefix: Optional[str] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> MemoryFilePage:
+        """List current memory files across entities. See
+        :meth:`AetherClient.list_memory_files`."""
+        return await _aexecute(
+            self,
+            _list_files_call(
+                entity_id=entity_id,
+                entity_prefix=entity_prefix,
+                prefix=prefix,
+                limit=limit,
+                cursor=cursor,
+            ),
+        )
+
+    async def grep_memory_files(
+        self,
+        pattern: str,
+        *,
+        entity_id: Optional[str] = None,
+        entity_prefix: Optional[str] = None,
+        regex: bool = False,
+        ignore_case: bool = False,
+        files: Optional[list[str]] = None,
+        context: int = 0,
+        max_matches: int = 100,
+    ) -> MemoryGrepResult:
+        """Search memory files line by line across entities. See
+        :meth:`AetherClient.grep_memory_files`."""
+        return await _aexecute(
+            self,
+            _grep_files_call(
+                pattern,
+                entity_id=entity_id,
+                entity_prefix=entity_prefix,
+                regex=regex,
+                ignore_case=ignore_case,
+                files=files,
+                context=context,
+                max_matches=max_matches,
+            ),
+        )
 
     async def list(
         self,
@@ -1281,6 +1472,7 @@ class AsyncAetherClient:
             updated_at=r.get("updated_at"),
             modality=r.get("modality"),
             query_id=query_id,
+            memory_file=parse_memory_file_hit(r.get("memory_file")),
         )
 
     async def send_search_feedback(self, query_id: str, doc_id: str, signal: str) -> None:
@@ -1713,8 +1905,10 @@ class AsyncAetherClient:
     ) -> list[RetrievalResult]:
         """Search and return results with document content included.
 
-        Uses server-side include_content when available.
-        Falls back to parallel downloads via asyncio.gather().
+        Per-document text reads run in parallel via asyncio.gather(): text-like
+        documents are downloaded and decoded; other types (PDF, Office, HTML,
+        CSV, ...) are read through get_text(), falling back to the matched
+        passage; media hits use their caption/transcript passage.
 
         The *entity_id*, *since*, *until*, *last_n_days*, *max_distance*,
         *any_tags*, *content_types*, *sources*, *recency_weight*,
@@ -1774,13 +1968,23 @@ class AsyncAetherClient:
         else:
             media_text_map = {}
 
-        # Download content only for text results that don't have it inline.
+        # Read content only for non-media results that don't have it inline:
+        # text-like types are downloaded, anything else (PDF, Office, ...) goes
+        # through /text so a binary original is never decoded as UTF-8.
         needs_download = [
             r for r in unique if r.content is None and not r.modality
         ]
         if needs_download:
             contents = await asyncio.gather(
-                *(self.download_text(r.doc_id) for r in needs_download)
+                *(
+                    _hydrate_document_text(
+                        self,
+                        r.doc_id,
+                        r.content_type,
+                        r.passage if r.passage is not None else "",
+                    )
+                    for r in needs_download
+                )
             )
             download_map = {r.doc_id: c for r, c in zip(needs_download, contents)}
         else:
@@ -1808,6 +2012,7 @@ class AsyncAetherClient:
                 created_at=r.created_at,
                 updated_at=r.updated_at,
                 modality=r.modality,
+                memory_file=r.memory_file,
             )
             for r in unique
         ]
@@ -1967,6 +2172,7 @@ class AsyncAetherClient:
         source: str | None = None,
         metadata: Metadata | None = None,
         acl_readers: list[str] | None = None,
+        summarize: bool | None = None,
     ) -> dict:
         """Enqueue a document for asynchronous processing.
         Returns a dict with: job_id, status, poll_url.
@@ -1979,6 +2185,10 @@ class AsyncAetherClient:
 
         Pass *acl_readers* to set the document's read-ACL — see
         :meth:`AetherClient.insert`.
+
+        Pass ``summarize=True`` / ``False`` to request or opt out of a
+        background summary — see :meth:`AetherClient.insert`. The completed
+        job (see :meth:`wait_for_job`) then reports ``summary_state``.
         """
         path = Path(file_path)
         data = path.read_bytes()
@@ -1999,6 +2209,7 @@ class AsyncAetherClient:
             url += f"&source={quote(source)}"
         if metadata is not None:
             url += f"&metadata={quote(_json_query_value(metadata))}"
+        url += _summarize_param(summarize)
         acl_param = _acl_readers_param(acl_readers)
         if acl_param is not None:
             url += f"&acl_readers={quote(acl_param)}"
@@ -2010,7 +2221,8 @@ class AsyncAetherClient:
         return resp.json()
 
     async def wait_for_job(self, job_id: str, timeout: float = 60.0, poll_interval: float = 1.0) -> dict:
-        """Wait for a background document job to complete."""
+        """Wait for a background document job to complete. See
+        :meth:`AetherClient.wait_for_job` (including ``summary_state``)."""
         if not job_id:
             raise ValueError("job_id cannot be empty")
         start = _time.time()
@@ -2031,12 +2243,17 @@ class AsyncAetherClient:
         documents: list[BatchInsertItem],
         chunk_size: int | None = None,
         overlap: int | None = None,
+        summarize: bool | None = None,
     ) -> list[DocumentRecord]:
         """Insert multiple text documents in a single batch request.
 
         Each item may carry its own ``acl_readers`` read-ACL, with the same
         semantics as :meth:`AetherClient.insert` (omitted -> unlabeled; empty
         list -> admin-only quarantine).
+
+        *summarize* requests (``True``) or opts out of (``False``) background
+        summaries for the whole batch; an item's own ``summarize`` overrides
+        it. See :meth:`AetherClient.batch_insert`.
         """
         if not documents:
             raise ValueError("documents cannot be empty")
@@ -2054,6 +2271,7 @@ class AsyncAetherClient:
                         if d.acl_readers is not None
                         else {}
                     ),
+                    **({"summarize": bool(d.summarize)} if d.summarize is not None else {}),
                     **({"partition": self._partition} if self._partition else {}),
                 }
                 for d in documents
@@ -2063,6 +2281,8 @@ class AsyncAetherClient:
             payload["chunk_size"] = chunk_size
         if overlap is not None:
             payload["overlap"] = overlap
+        if summarize is not None:
+            payload["summarize"] = bool(summarize)
 
         resp = await self._request_with_retry("POST", "/documents/batch", json=payload)
         self._raise_for_status(resp)

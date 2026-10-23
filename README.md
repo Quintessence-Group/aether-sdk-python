@@ -174,3 +174,48 @@ aether-py list
 ## License
 
 MIT
+
+### Memory files
+
+Memory files are named, versioned markdown files kept per entity — for example a
+`memory.md` an agent reads at the start of a session and keeps up to date. Every
+change writes a new version; older versions stay readable and diffable.
+
+```python
+files = mem.files  # scoped to the Memory's entity (and its client's partition)
+
+files.write("memory.md", "# Acme memory\n\n## Agreed terms\n", create=True)
+
+### Reading a document's text
+
+`get_text()` returns the parsed, readable text of any stored document — the
+original for text types, the caption or transcript for media, and text rebuilt
+from the parsed passages for PDF/Office — paged and addressable by section:
+
+```python
+outline = client.get_text(doc_id, outline=True)
+print([s.heading for s in outline.sections])
+
+terms = client.get_text(doc_id, section="Payment terms")
+
+page = client.get_text(doc_id, max_bytes=65536)
+while page.truncated:
+    page = client.get_text(doc_id, offset=page.next_offset, max_bytes=65536)
+```
+
+### Document summaries
+
+Ask for a summary at ingest with `summarize=True` — on `insert`, `insert_text`,
+`insert_stream`, `insert_async` and `batch_insert` (per batch or per item), or as a
+`Memory(..., summarize=True)` default with a per-call `remember(..., summarize=...)`
+override. The summary is generated in the background after the insert commits and never
+fails or delays it; the returned record's `summary` is `"pending"` or `"skipped"`.
+`summarize=False` opts out of a tenant default; leaving it unset applies that default.
+
+```python
+doc = client.insert("contract.pdf", summarize=True)
+
+s = client.get_summary(doc.doc_id)
+print(s.state)    # none | pending | ready | failed | skipped | unsupported
+print(s.content)  # the stored summary markdown, if any (readable even while pending)
+print(s.stale)    # True when the document changed after the summary was written

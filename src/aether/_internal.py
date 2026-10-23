@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ipaddress
 import platform
+import re
 import uuid
 from importlib.metadata import PackageNotFoundError, version as _dist_version
 from typing import Optional
@@ -54,6 +55,59 @@ def new_idempotency_key() -> str:
     minted for each distinct call.
     """
     return str(uuid.uuid4())
+
+
+#: Largest page ``get_text`` can return (1 MiB); hydration reads up to this.
+MAX_TEXT_PAGE_BYTES = 1_048_576
+
+_NON_TEXT_TEXT_TYPES = frozenset(
+    {"text/html", "text/csv", "text/tab-separated-values", "text/rtf"}
+)
+_TEXT_LIKE_APPLICATION_TYPES = frozenset(
+    {
+        "application/json",
+        "application/xml",
+        "application/javascript",
+        "application/typescript",
+        "application/x-yaml",
+    }
+)
+
+
+def is_text_like_content_type(content_type: Optional[str]) -> bool:
+    """Whether a document of this content type can be read by decoding its
+    original bytes as UTF-8.
+
+    ``text/*`` qualifies except HTML, CSV, TSV and RTF (the server parses
+    those), plus a few structured application types. Everything else — PDF,
+    Office, octet-stream, a missing type — is read through ``get_text``.
+    """
+    base = (content_type or "").split(";", 1)[0].strip().lower()
+    if base.startswith("text/"):
+        return base not in _NON_TEXT_TEXT_TYPES
+    return base in _TEXT_LIKE_APPLICATION_TYPES
+
+
+_DECIMAL_RE = re.compile(r"[0-9]+")
+
+
+def parse_etag_version(etag: Optional[str]) -> Optional[int]:
+    """Parse a memory-file ``ETag`` header into its version number.
+
+    Strips an optional ``W/`` prefix and the surrounding double quotes, then
+    parses the decimal: ``"7"`` -> 7, ``7`` -> 7. Anything else (a missing
+    header, a non-decimal tag) gives ``None``.
+    """
+    if not etag:
+        return None
+    tag = etag.strip()
+    if tag.startswith("W/"):
+        tag = tag[2:]
+    if len(tag) >= 2 and tag[0] == '"' and tag[-1] == '"':
+        tag = tag[1:-1]
+    if not _DECIMAL_RE.fullmatch(tag):
+        return None
+    return int(tag)
 
 
 def _is_loopback(host: str) -> bool:
